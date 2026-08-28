@@ -49,6 +49,15 @@ INCLUDE_ARGS := $(subst ./,-I,$(shell find . -mindepth 1 -type d -print)) \
 #
 MACRO_ARGS := $(addprefix -D,$(PRE_PROCESS_MACROS))
 
+# Generated C++ sits in the working directory beside the Fortran it is called
+# from, but the dependency analysis is Fortran-only and so says nothing about
+# it. Find it directly. A C++ translation unit has no module prerequisites, so
+# there is nothing for the analysis to contribute: it is compiled on its own
+# and reaches the link through the archive below.
+#
+CXX_SOURCE_FILES := $(subst ./,,$(shell find . -name '*.cpp' -print))
+CXX_OBJECTS := $(CXX_SOURCE_FILES:.cpp=.o)
+
 include programs.mk
 
 PROGRAMS ?= $(basename $(notdir $(PROG_OBJS)))
@@ -141,7 +150,7 @@ $(BIN_DIR)/%: %.o $$(LIB_DIR)/lib$$(*F).a
 	            $(patsubst %,-l%,$(EXTERNAL_DYNAMIC_LIBRARIES))
 
 .PRECIOUS: $(LIB_DIR)/lib%.a
-$(LIB_DIR)/lib%.a: $$($$(shell basename $$* | tr a-z A-Z)_OBJS) | $(LIB_DIR)
+$(LIB_DIR)/lib%.a: $$($$(shell basename $$* | tr a-z A-Z)_OBJS) $(CXX_OBJECTS) | $(LIB_DIR)
 	$(call MESSAGE,Archiving,$(@F))
 	$(Q) ar -rcs $@ $^
 
@@ -160,6 +169,16 @@ $(LIB_DIR)/lib%.a: $$($$(shell basename $$* | tr a-z A-Z)_OBJS) | $(LIB_DIR)
 	          $(MODULE_DESTINATION_ARGUMENT) \
 	          $(MODULE_SOURCE_ARGUMENT) \
 	          $(INCLUDE_ARGS) $(MACRO_ARGS) -c -o $(basename $@).o $<
+	$(call MESSAGE,Compiled,$<)
+
+# Generated C++. Everything it needs beyond the compiler itself arrives in
+# CXXFLAGS, which the project sets, so the rule stays independent of any
+# particular library. There is no module machinery because C++ has none.
+#
+%.o: %.cpp
+	$(call MESSAGE,Compile,$<)
+	$(Q)$(TIME_TOOL) $(CXX) $(CXXFLAGS) $(CXXFLAGS_EXTRA) \
+	          -c -o $(basename $@).o $<
 	$(call MESSAGE,Compiled,$<)
 
 

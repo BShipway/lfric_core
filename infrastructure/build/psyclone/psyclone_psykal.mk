@@ -47,7 +47,12 @@ $$(SOURCE_DIR)/psy/$$(notdir $$*)_psy.f90 $(WORKING_DIR)/%_psy.f90
 
 # Where an optimisation script exists for a specific file, use it.
 #
-$(WORKING_DIR)/%.f90 $(WORKING_DIR)/%_psy.f90: \
+# A local script may also emit a C++ sidecar next to the PSy layer, which
+# compile.mk then finds and builds. Naming it here records that it is an output
+# of this rule rather than a stray file in the working directory. Scripts that
+# emit no sidecar are unaffected: nothing asks make for one.
+#
+$(WORKING_DIR)/%.f90 $(WORKING_DIR)/%_psy.f90 $(WORKING_DIR)/%_kokkos.cpp: \
 $(WORKING_DIR)/%.x90 $$(OPTIMISATION_PATH)/$(DSL)/$$*.py | $$(dir $$@)
 	$(call MESSAGE,PSyclone - local optimisation,$(subst $(SOURCE_DIR)/,,$<))
 	$QPYTHONPATH=$(LFRIC_BUILD)/psyclone:$$PYTHONPATH psyclone -api lfric \
