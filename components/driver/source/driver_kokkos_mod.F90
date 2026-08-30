@@ -27,7 +27,8 @@
 !>
 module driver_kokkos_mod
 
-  use kokkos_memory_mod, only: kokkos_shared_release_all
+  use kokkos_memory_mod, only: kokkos_shared_release_all, &
+                               kokkos_shared_report
 
   implicit none
 
@@ -73,9 +74,22 @@ contains
   !>          without Kokkos too, where the blocks came from ALLOCATE: leaving
   !>          the two builds to reclaim at different points would be a
   !>          difference between them that nothing else in the run needs.
+  !>
+  !>          The shared-space high-water mark is then reported, to standard
+  !>          error because gungho_model.f90 calls final_logger before
+  !>          final_kokkos and so has no logger left. Reporting after the
+  !>          release rather than before it is what makes the live figures a
+  !>          leak check: everything this run claimed has been given back by
+  !>          then, so a non-zero live count is a block claimed by something
+  !>          the registry did not see. The peak figures survive the release
+  !>          and are what say the storage was ever taken from shared space.
+  !>          Both must come before Kokkos::finalize, since the counters they
+  !>          read live in a translation unit whose state means nothing after
+  !>          it.
   subroutine final_kokkos()
 
     call kokkos_shared_release_all()
+    call kokkos_shared_report()
 
 #ifdef USE_KOKKOS
     call lfric_kokkos_finalise()

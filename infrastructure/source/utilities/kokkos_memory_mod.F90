@@ -49,7 +49,7 @@ module kokkos_memory_mod
   ! real32, real64 and int32 are the kinds field_mod.t90 is instantiated for.
   ! They come from iso_fortran_env rather than constants_mod because
   ! constants_mod imports them without exporting them.
-  use, intrinsic :: iso_fortran_env, only : real32, real64, int32
+  use, intrinsic :: iso_fortran_env, only : real32, real64, int32, error_unit
 
   use, intrinsic :: iso_c_binding,   only : c_ptr, c_size_t, c_int,          &
                                             c_associated, c_f_pointer,       &
@@ -570,15 +570,29 @@ contains
 
   end function kokkos_shared_peak_bytes
 
-  !> @brief Writes a one-line shared-space summary to standard error.
+  !> @brief Writes a shared-space summary to standard error.
   !> @details Called on the way out, from driver_kokkos_mod's finalise. It
   !>          writes to standard error rather than through log_mod because
   !>          gungho_model finalises the logger before it finalises Kokkos, so
-  !>          there is no logger left to write to. Does nothing without
-  !>          USE_KOKKOS.
+  !>          there is no logger left to write to.
+  !>
+  !>          Two lines, answering two different questions. The registry line
+  !>          is written by both builds and says how many blocks were claimed
+  !>          at once, which is what shows a caller's opt-in set is bounded;
+  !>          the allocator line comes from the C++ side and needs USE_KOKKOS,
+  !>          and says how many bytes shared space actually issued. A build
+  !>          that defines USE_KOKKOS but never reaches a running runtime
+  !>          prints a registry line with blocks in it and an allocator line
+  !>          with a zero peak, which is the distinction the pair exists to
+  !>          make visible.
   subroutine kokkos_shared_report()
 
     implicit none
+
+    write( error_unit, '(A,I0,A,I0,A)' )                                     &
+        'lfric_kokkos_registry: ', n_claimed, ' blocks claimed, ',           &
+        peak_claimed, ' at peak'
+    flush( error_unit )
 
 #ifdef USE_KOKKOS
     call lfric_kokkos_shared_report()
