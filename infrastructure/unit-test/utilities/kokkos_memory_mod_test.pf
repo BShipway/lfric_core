@@ -1,0 +1,180 @@
+!-----------------------------------------------------------------------------
+! (C) Crown copyright 2026 Met Office. All rights reserved.
+! The file LICENCE, distributed with this code, contains details of the terms
+! under which the code may be used.
+!-----------------------------------------------------------------------------
+
+!> @brief Tests the shared-space allocator's Fortran face.
+!>
+!> @details These cases exercise the ALLOCATE fallback and nothing else. The
+!>          unit-test suite is built without USE_KOKKOS -- that macro is set
+!>          only by lfric_apps/applications/gungho_model/Makefile -- so every
+!>          '#ifdef USE_KOKKOS' branch in kokkos_memory_mod is absent from the
+!>          object these cases link against. A green run here is therefore
+!>          evidence that a Fortran-only build is unchanged, and is not cover
+!>          for the Kokkos branch. That branch is covered instead by
+!>          psy-ir-aidev's tests/test_kokkos_shared_memory.sh, which builds the
+!>          same two source files both ways and compares the byte counts.
+!>
+module kokkos_memory_mod_test
+
+  use, intrinsic :: iso_fortran_env, only : real64, int32
+
+  use constants_mod,     only : i_def, i_long
+  use kokkos_memory_mod, only : kokkos_shared_allocate, &
+                                kokkos_shared_free,     &
+                                kokkos_shared_bytes,    &
+                                kokkos_shared_peak_bytes, &
+                                kokkos_shared_in_use
+
+  use funit
+
+  implicit none
+
+contains
+
+  !> Test that a 64-bit real array round-trips through allocate and free.
+  !>
+  @test
+  subroutine test_real64_round_trip( )
+
+    implicit none
+
+    real(real64), pointer :: array( : ) => null()
+    integer(i_def)        :: i
+    integer(i_def), parameter :: length = 1024_i_def
+
+    call kokkos_shared_allocate( array, length )
+
+    @assertTrue(associated(array))
+    @assertEqual(1_i_def, int(lbound(array, 1), i_def))
+    @assertEqual(length,  int(ubound(array, 1), i_def))
+    @assertEqual(length,  int(size(array), i_def))
+
+    do i = 1, length
+      array(i) = real(i, real64)
+    end do
+
+    do i = 1, length
+      @assertEqual(real(i, real64), array(i))
+    end do
+
+    call kokkos_shared_free( array )
+
+    @assertFalse(associated(array))
+
+  end subroutine test_real64_round_trip
+
+  !> Test that a 32-bit integer array round-trips through allocate and free.
+  !>
+  @test
+  subroutine test_int32_round_trip( )
+
+    implicit none
+
+    integer(int32), pointer :: array( : ) => null()
+    integer(i_def)          :: i
+    integer(i_def), parameter :: length = 512_i_def
+
+    call kokkos_shared_allocate( array, length )
+
+    @assertTrue(associated(array))
+    @assertEqual(1_i_def, int(lbound(array, 1), i_def))
+    @assertEqual(length,  int(size(array), i_def))
+
+    do i = 1, length
+      array(i) = int(2_i_def * i, int32)
+    end do
+
+    do i = 1, length
+      @assertEqual(int(2_i_def * i, int32), array(i))
+    end do
+
+    call kokkos_shared_free( array )
+
+    @assertFalse(associated(array))
+
+  end subroutine test_int32_round_trip
+
+  !> Test that allocating over a live pointer releases the old block first.
+  !>
+  !> @details The old block cannot be observed directly from Fortran, so what
+  !>          is asserted is the consequence the caller can see: the pointer
+  !>          ends up with the new length rather than the old one, and the
+  !>          shared accounting is back to where it started afterwards. A
+  !>          leaked block would leave that accounting non-zero in a Kokkos
+  !>          build; here it is zero throughout, which the next case states.
+  !>
+  @test
+  subroutine test_reallocation_replaces_the_block( )
+
+    implicit none
+
+    real(real64), pointer :: array( : ) => null()
+    integer(i_def), parameter :: first  = 16_i_def
+    integer(i_def), parameter :: second = 32_i_def
+
+    call kokkos_shared_allocate( array, first )
+    @assertEqual(first, int(size(array), i_def))
+
+    array(:) = 1.0_real64
+
+    call kokkos_shared_allocate( array, second )
+
+    @assertTrue(associated(array))
+    @assertEqual(second, int(size(array), i_def))
+
+    array(:) = 2.0_real64
+    @assertEqual(2.0_real64, array(1))
+    @assertEqual(2.0_real64, array(second))
+
+    call kokkos_shared_free( array )
+
+    @assertFalse(associated(array))
+    @assertEqual(0_i_long, kokkos_shared_bytes())
+
+  end subroutine test_reallocation_replaces_the_block
+
+  !> Test that freeing a pointer that was never associated is a no-op.
+  !>
+  @test
+  subroutine test_free_of_null_pointer_is_safe( )
+
+    implicit none
+
+    real(real64), pointer :: array( : ) => null()
+
+    call kokkos_shared_free( array )
+
+    @assertFalse(associated(array))
+
+  end subroutine test_free_of_null_pointer_is_safe
+
+  !> Test that the accounting reports nothing in a build without USE_KOKKOS.
+  !>
+  !> @details This is the case that says which build the suite is. If
+  !>          USE_KOKKOS were ever defined for the unit tests these three
+  !>          assertions would fail on the first allocation, which is the
+  !>          intended signal: the rest of this module would then be testing a
+  !>          path it does not claim to cover.
+  !>
+  @test
+  subroutine test_accounting_is_absent_without_kokkos( )
+
+    implicit none
+
+    real(real64), pointer :: array( : ) => null()
+
+    call kokkos_shared_allocate( array, 256_i_def )
+
+    @assertEqual(0_i_long, kokkos_shared_bytes())
+    @assertEqual(0_i_long, kokkos_shared_peak_bytes())
+    @assertFalse(kokkos_shared_in_use())
+
+    call kokkos_shared_free( array )
+
+    @assertEqual(0_i_long, kokkos_shared_bytes())
+
+  end subroutine test_accounting_is_absent_without_kokkos
+
+end module kokkos_memory_mod_test
