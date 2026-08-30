@@ -144,7 +144,14 @@ contains
         twod_mesh => mesh_collection%get_mesh(mesh, twod)
         fs => function_space_collection%get_fs(twod_mesh, 0, 0, W3)
         halo_depth = twod_mesh%get_halo_depth()
-        call panel_id%initialise(fs, halo_depth=halo_depth)
+        ! The coordinate fields take their data from Kokkos shared space where
+        ! a Kokkos build is running, so that one address serves both the
+        ! kernels below and any generated Kokkos region reading them. They are
+        ! asked for it and other fields are not because a claimed block is not
+        ! released until shutdown: these are created once per mesh here and
+        ! copied once into their inventories, so the claim is bounded
+        call panel_id%initialise(fs, halo_depth=halo_depth, &
+                                 shared_data=.true._l_def)
 
         ! Initialise chi field object ------------------------------------------
         ! Set coordinate order for this mesh
@@ -208,7 +215,8 @@ contains
                                                 chi_space )
 
         do coord = 1, size(chi)
-          call chi(coord)%initialise(fs, halo_depth=halo_depth)
+          call chi(coord)%initialise(fs, halo_depth=halo_depth, &
+                                     shared_data=.true._l_def)
         end do
 
         ! Set coordinate fields --------------------------------------------------

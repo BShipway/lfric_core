@@ -27,6 +27,8 @@
 !>
 module driver_kokkos_mod
 
+  use kokkos_memory_mod, only: kokkos_shared_release_all
+
   implicit none
 
   private
@@ -60,8 +62,20 @@ contains
 
   !> @brief Finalises the Kokkos runtime.
   !> @details Called before the model communicator is destroyed, for the same
-  !>          reason. Does nothing in a build without Kokkos.
+  !>          reason. The Kokkos call itself does nothing in a build without
+  !>          Kokkos; the release below runs in both.
+  !>
+  !>          The blocks kokkos_memory_mod is holding are released first,
+  !>          because one from shared space cannot be returned after the
+  !>          runtime it came from has gone. Anything still pointing at a
+  !>          claimed block is dangling afterwards, which is why this happens
+  !>          on the way out and nowhere else. The release runs in a build
+  !>          without Kokkos too, where the blocks came from ALLOCATE: leaving
+  !>          the two builds to reclaim at different points would be a
+  !>          difference between them that nothing else in the run needs.
   subroutine final_kokkos()
+
+    call kokkos_shared_release_all()
 
 #ifdef USE_KOKKOS
     call lfric_kokkos_finalise()

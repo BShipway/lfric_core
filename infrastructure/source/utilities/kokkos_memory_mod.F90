@@ -33,6 +33,17 @@
 !>          side whether it issued that particular address rather than
 !>          consulting a flag.
 !>
+!>          kokkos_shared_claim allocates a block and keeps owning it, until
+!>          kokkos_shared_release_all is called on the way out. That exists
+!>          because a Fortran object cannot own a block it holds by pointer:
+!>          ALLOCATE with SOURCE= duplicates such an object without duplicating
+!>          the storage and without giving the type any way to notice, so the
+!>          copy and the original would both free it. Whoever claims a block
+!>          therefore states its lifetime by claiming it, and a claimed block
+!>          is not reclaimed until the run ends. kokkos_shared_claimed_blocks
+!>          reports how many are outstanding, so that a caller opting fields in
+!>          can show the count is bounded rather than assert it.
+!>
 module kokkos_memory_mod
 
   ! real32, real64 and int32 are the kinds field_mod.t90 is instantiated for.
@@ -50,12 +61,41 @@ module kokkos_memory_mod
 
   private
 
-  public :: kokkos_shared_allocate,   &
-            kokkos_shared_free,       &
-            kokkos_shared_bytes,      &
-            kokkos_shared_peak_bytes, &
-            kokkos_shared_report,     &
+  public :: kokkos_shared_allocate,       &
+            kokkos_shared_free,           &
+            kokkos_shared_claim,          &
+            kokkos_shared_release_all,    &
+            kokkos_shared_claimed_blocks, &
+            kokkos_shared_bytes,          &
+            kokkos_shared_peak_bytes,     &
+            kokkos_shared_report,         &
             kokkos_shared_in_use
+
+  !> @brief One block this module has claimed and still owns.
+  !> @details Exactly one of the three pointers is associated, which is what
+  !>          says the block's kind. The Fortran pointer is held rather than
+  !>          the address, because a block that fell back to ALLOCATE has to be
+  !>          released by DEALLOCATE of that same pointer; one rebuilt from an
+  !>          address by c_f_pointer would not be it.
+  type :: shared_block_type
+    real(real32),   pointer :: values_real32( : ) => null()
+    real(real64),   pointer :: values_real64( : ) => null()
+    integer(int32), pointer :: values_int32( : )  => null()
+  end type shared_block_type
+
+  !> Blocks claimed and not yet released. Grown by doubling.
+  type(shared_block_type), allocatable, save :: claimed( : )
+
+  !> How many leading entries of 'claimed' are in use.
+  integer(i_def), save :: n_claimed = 0_i_def
+
+  !> The largest n_claimed has ever been. Kept because release_all takes
+  !> n_claimed back to zero, so the count a caller needs in order to show its
+  !> opt-in set is bounded is gone by the time anything reports it.
+  integer(i_def), save :: peak_claimed = 0_i_def
+
+  !> Entries the registry starts with, and the least it ever grows to.
+  integer(i_def), parameter :: initial_registry_size = 16_i_def
 
   !> @brief Allocates a rank-one pointer array, from shared space where that
   !>        is available and by ALLOCATE where it is not.
@@ -64,6 +104,14 @@ module kokkos_memory_mod
     module procedure kokkos_shared_allocate_real64
     module procedure kokkos_shared_allocate_int32
   end interface kokkos_shared_allocate
+
+  !> @brief Allocates a rank-one pointer array that this module keeps owning
+  !>        until kokkos_shared_release_all.
+  interface kokkos_shared_claim
+    module procedure kokkos_shared_claim_real32
+    module procedure kokkos_shared_claim_real64
+    module procedure kokkos_shared_claim_int32
+  end interface kokkos_shared_claim
 
   !> @brief Releases an array that kokkos_shared_allocate returned, by
   !>        whichever route it was allocated through.
@@ -339,6 +387,156 @@ contains
     deallocate( array )
 
   end subroutine kokkos_shared_free_int32
+
+  !> @brief Records a claimed block, growing the registry when it is full.
+  !> @param [in] record   The block to take ownership of. Exactly one of its
+  !>                      three pointers is expected to be associated.
+  subroutine remember_block( record )
+
+    implicit none
+
+    type(shared_block_type), intent(in) :: record
+
+    type(shared_block_type), allocatable :: bigger( : )
+
+    if ( .not. allocated(claimed) ) then
+      allocate( claimed(initial_registry_size) )
+      n_claimed = 0_i_def
+    end if
+
+    if ( n_claimed == size(claimed, kind=i_def) ) then
+      allocate( bigger(2_i_def * n_claimed) )
+      bigger(1:n_claimed) = claimed(1:n_claimed)
+      call move_alloc( bigger, claimed )
+    end if
+
+    n_claimed = n_claimed + 1_i_def
+    claimed(n_claimed) = record
+
+    if ( n_claimed > peak_claimed ) peak_claimed = n_claimed
+
+  end subroutine remember_block
+
+  !> @brief Claims a 32-bit real array on the caller's behalf.
+  !> @details The pointer is disassociated before allocating rather than being
+  !>          handed straight to kokkos_shared_allocate, which releases an
+  !>          associated pointer on entry. A claimed block belongs to the
+  !>          registry, so a caller passing one back in must not have it freed
+  !>          from under the registry's record of it.
+  !> @param [in,out] array   Pointer to allocate. On return it is associated
+  !>                         with 'length' elements, lower bound one.
+  !> @param [in] length      Number of elements required.
+  subroutine kokkos_shared_claim_real32( array, length )
+
+    implicit none
+
+    real(real32), pointer, intent(inout) :: array( : )
+    integer(i_def),        intent(in)    :: length
+
+    type(shared_block_type) :: record
+
+    array => null()
+    call kokkos_shared_allocate( array, length )
+
+    record%values_real32 => array
+    call remember_block( record )
+
+  end subroutine kokkos_shared_claim_real32
+
+  !> @brief Claims a 64-bit real array on the caller's behalf.
+  !> @details The pointer is disassociated before allocating rather than being
+  !>          handed straight to kokkos_shared_allocate, which releases an
+  !>          associated pointer on entry. A claimed block belongs to the
+  !>          registry, so a caller passing one back in must not have it freed
+  !>          from under the registry's record of it.
+  !> @param [in,out] array   Pointer to allocate. On return it is associated
+  !>                         with 'length' elements, lower bound one.
+  !> @param [in] length      Number of elements required.
+  subroutine kokkos_shared_claim_real64( array, length )
+
+    implicit none
+
+    real(real64), pointer, intent(inout) :: array( : )
+    integer(i_def),        intent(in)    :: length
+
+    type(shared_block_type) :: record
+
+    array => null()
+    call kokkos_shared_allocate( array, length )
+
+    record%values_real64 => array
+    call remember_block( record )
+
+  end subroutine kokkos_shared_claim_real64
+
+  !> @brief Claims a 32-bit integer array on the caller's behalf.
+  !> @details The pointer is disassociated before allocating rather than being
+  !>          handed straight to kokkos_shared_allocate, which releases an
+  !>          associated pointer on entry. A claimed block belongs to the
+  !>          registry, so a caller passing one back in must not have it freed
+  !>          from under the registry's record of it.
+  !> @param [in,out] array   Pointer to allocate. On return it is associated
+  !>                         with 'length' elements, lower bound one.
+  !> @param [in] length      Number of elements required.
+  subroutine kokkos_shared_claim_int32( array, length )
+
+    implicit none
+
+    integer(int32), pointer, intent(inout) :: array( : )
+    integer(i_def),          intent(in)    :: length
+
+    type(shared_block_type) :: record
+
+    array => null()
+    call kokkos_shared_allocate( array, length )
+
+    record%values_int32 => array
+    call remember_block( record )
+
+  end subroutine kokkos_shared_claim_int32
+
+  !> @brief Releases every block this module has claimed.
+  !> @details Called on the way out, before Kokkos::finalize, since a block
+  !>          from shared space cannot be returned once the runtime has gone.
+  !>          Whatever still points at a released block is dangling afterwards,
+  !>          which is why this is a shutdown operation and not a way of
+  !>          reclaiming storage during a run.
+  subroutine kokkos_shared_release_all()
+
+    implicit none
+
+    integer(i_def) :: i
+
+    if ( .not. allocated(claimed) ) return
+
+    do i = n_claimed, 1_i_def, -1_i_def
+      if ( associated(claimed(i)%values_real32) ) then
+        call kokkos_shared_free( claimed(i)%values_real32 )
+      else if ( associated(claimed(i)%values_real64) ) then
+        call kokkos_shared_free( claimed(i)%values_real64 )
+      else if ( associated(claimed(i)%values_int32) ) then
+        call kokkos_shared_free( claimed(i)%values_int32 )
+      end if
+    end do
+
+    n_claimed = 0_i_def
+
+  end subroutine kokkos_shared_release_all
+
+  !> @brief Reports how many claimed blocks are outstanding.
+  !> @details A caller that opts fields in to shared storage can watch this
+  !>          across two runs of different length to show that its opt-in set
+  !>          is bounded, which the registry itself cannot know.
+  !> @return blocks   Blocks claimed and not yet released.
+  function kokkos_shared_claimed_blocks() result(blocks)
+
+    implicit none
+
+    integer(i_def) :: blocks
+
+    blocks = n_claimed
+
+  end function kokkos_shared_claimed_blocks
 
   !> @brief Reports the shared-space bytes currently allocated.
   !> @return bytes   Live shared-space bytes; zero without USE_KOKKOS.

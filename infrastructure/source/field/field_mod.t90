@@ -32,6 +32,7 @@ module field_{{kind}}_mod
                                   perform_halo_exchange, &
                                   perform_halo_exchange_start, &
                                   perform_halo_exchange_finish
+  use kokkos_memory_mod,    only: kokkos_shared_claim
   use mesh_mod,             only: mesh_type
   use log_mod,              only: log_event, &
                                   log_scratch_space, &
@@ -67,6 +68,12 @@ module field_{{kind}}_mod
     !> Enable field to point to bespoke data provided by application
     !> instead of having allocated data
     {{type}}({{kind}}), pointer :: override_data( : )
+    !> Whether override_data points at a block claimed from Kokkos shared
+    !> space rather than at storage the application supplied. It says where
+    !> the data came from, not what it holds, and SOURCE= copies it along with
+    !> the pointer beside it -- which is right, because a copy of a shared
+    !> field reads the same shared block and so is shared too.
+    logical(l_def) :: data_is_shared = .false.
 
     ! IO interface procedure pointers
 
@@ -84,6 +91,9 @@ module field_{{kind}}_mod
 
     ! Routine to return a deep, but empty copy of a field
     procedure, public :: copy_field_properties
+
+    ! Routine to reach whichever of the two data components holds the values
+    procedure, private :: effective_data
 
     !> Function to get a proxy with public pointers to the data in a
     !! field_type.
@@ -248,12 +258,22 @@ contains
   !> @param [in] name The field name. 'none' (constant name_none) is a reserved name
   !> @param [in] override_data Optional alternative data that can be attached to field
   !> @param [in] halo_depth Optional alternative halo depth
+  !> @param [in] shared_data Optional request that the field's data be claimed
+  !!                         from Kokkos shared space, so that a generated
+  !!                         Kokkos region and this field see one address.
+  !!                         Ignored when override_data is given, since that
+  !!                         names storage the caller already has. The claimed
+  !!                         block is owned by kokkos_memory_mod and released
+  !!                         at shutdown, so this should be asked for only by a
+  !!                         caller whose fields are created a bounded number
+  !!                         of times.
   !>
   subroutine field_initialiser(self, &
                                vector_space, &
                                name, &
                                override_data, &
-                               halo_depth)
+                               halo_depth, &
+                               shared_data)
 
     use, intrinsic :: ieee_arithmetic, only: IEEE_INVALID
     use, intrinsic :: ieee_exceptions, only: ieee_set_halting_mode, ieee_get_halting_mode
@@ -265,8 +285,12 @@ contains
     character(*), optional, intent(in)             :: name
     {{type}}({{kind}}), target, optional, intent(in)     :: override_data( : )
     integer(i_def), optional, intent(in)           :: halo_depth
+    logical(l_def), optional, intent(in)           :: shared_data
 
     character(str_def) :: local_name
+
+    ! Whether to claim the data from shared space rather than ALLOCATE it
+    logical(l_def) :: claim_shared
 
     type(mesh_type), pointer :: mesh
 
@@ -281,6 +305,9 @@ contains
     if ( LPROF ) call start_timing(id, 'field.initialise')
 
     mesh => null()
+
+    claim_shared = .false.
+    if ( present(shared_data) ) claim_shared = shared_data
 
     if ( present(name) ) then
       local_name = name
@@ -312,9 +339,38 @@ contains
                                        halo_depth=field_halo_depth)
 
     ! Associate data with the field
+    self%data_is_shared = .false.
+
     if (present(override_data))then
       ! Override normal field data if an alternative was provided
       self%override_data => override_data
+    else if (claim_shared) then
+      ! Take the data from Kokkos shared space instead, so that one address is
+      ! valid here and in a generated Kokkos region. It arrives through
+      ! override_data rather than through data, so that the field holds it by
+      ! a pointer it does not own: a field cannot own such a block, because
+      ! ALLOCATE with SOURCE= duplicates the field without duplicating the
+      ! block and without giving the type any way to notice, leaving two
+      ! objects that would each free it. kokkos_memory_mod owns it instead and
+      ! releases it at shutdown.
+      self%override_data => null()
+      call kokkos_shared_claim( self%override_data,   &
+             vector_space%get_last_dof_halo(field_halo_depth) )
+      self%data_is_shared = .true.
+
+      ! If run-time checking is on then initialise data with a signalling value
+      call ieee_get_halting_mode(IEEE_INVALID, halt_mode)
+
+      if (halt_mode) then
+        ! Temporarily turn off halting mode to safely set invalid value
+        call ieee_set_halting_mode(IEEE_INVALID, .false.)
+
+        signalling_value = get_signalling_value(signalling_value)
+        self%override_data(:) = signalling_value
+
+        call ieee_set_halting_mode(IEEE_INVALID, .true.)
+      end if
+
     else
       ! Create space for holding field data
 
@@ -364,6 +420,32 @@ contains
     type(field_{{kind}}_pointer_type), intent(inout) :: self
   end subroutine field_{{kind}}_pointer_destructor
 
+  !> Return a pointer to the field's values, wherever they are held.
+  !>
+  !> @details A field keeps its values either in the allocatable data
+  !>          component or, when the application supplied storage or the field
+  !>          was given shared space, in the override_data pointer. get_proxy
+  !>          makes that choice inline for the Psy layer; this makes the same
+  !>          choice for the routines in this module that need the values
+  !>          rather than a proxy.
+  !>
+  !> @return values   The field's values, or a disassociated pointer if the
+  !>                  field has none.
+  function effective_data(self) result(values)
+
+    implicit none
+
+    class(field_{{kind}}_type), target, intent(in) :: self
+    {{type}}({{kind}}), pointer                    :: values( : )
+
+    if ( allocated(self%data) ) then
+      values => self%data
+    else
+      values => self%override_data
+    end if
+
+  end function effective_data
+
   !> Create a new field that inherits the properties of the source field and
   !> has a copy of all the field data from the source field.
   !>
@@ -376,7 +458,15 @@ contains
     type(field_{{kind}}_type),  target, intent(out) :: dest
     character(*),           optional, intent(in)  :: name
 
-    if ( .not. allocated(self%data) ) then
+    {{type}}({{kind}}), pointer :: source_values( : )
+
+    ! Asks where the values are rather than whether data is allocated, so that
+    ! a field holding its values through override_data can be copied. A field
+    ! given shared space is one such, and so is one the application gave
+    ! storage to
+    source_values => self%effective_data()
+
+    if ( .not. associated(source_values) ) then
       call log_event( 'Error: copy_field_serial: Copied field must have field data', &
            LOG_LEVEL_ERROR )
     end if
@@ -387,7 +477,16 @@ contains
       call self%copy_field_properties(dest)
     end if
 
-    dest%data(:) = self%data(:)
+    ! The same question is asked of the destination, but inline rather than
+    ! through effective_data. That function's argument is intent(in), and a
+    ! pointer obtained from an intent(in) target must not be used to write to
+    ! it, so it can find the source's values but not fill the copy's
+    if ( allocated(dest%data) ) then
+      dest%data(:) = source_values(:)
+    else
+      dest%override_data(:) = source_values(:)
+    end if
+
     call self%copy_field_parent(dest)
 
   end subroutine copy_field_serial
@@ -408,14 +507,21 @@ contains
     ! Get function space from parent
     function_space => self%get_function_space()
 
+    ! The copy takes its data from wherever the source took its own. A copy of
+    ! a shared field has to be shared as well: the copy is what a collection
+    ! keeps and the model then reads, so leaving it in ordinary memory would
+    ! put the values the model uses outside shared space while appearing to
+    ! have moved them into it
     if (present(name)) then
       call dest%initialise(vector_space = function_space,      &
                            name = name, &
-                           halo_depth = self%get_field_halo_depth())
+                           halo_depth = self%get_field_halo_depth(), &
+                           shared_data = self%data_is_shared)
     else
       call dest%initialise(vector_space = function_space,      &
                            name = self%get_name(), &
-                           halo_depth = self%get_field_halo_depth())
+                           halo_depth = self%get_field_halo_depth(), &
+                           shared_data = self%data_is_shared)
     end if
 
     dest%write_method => self%write_method
