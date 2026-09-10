@@ -20,12 +20,20 @@ module kokkos_memory_mod_test
 
   use, intrinsic :: iso_fortran_env, only : real64, int32
 
-  use constants_mod,     only : i_def, i_long
+  use constants_mod,     only : i_def, i_long, l_def
   use kokkos_memory_mod, only : kokkos_shared_allocate, &
                                 kokkos_shared_free,     &
                                 kokkos_shared_bytes,    &
                                 kokkos_shared_peak_bytes, &
-                                kokkos_shared_in_use
+                                kokkos_shared_in_use,   &
+                                kokkos_shared_claim,    &
+                                kokkos_shared_release,  &
+                                kokkos_shared_release_all, &
+                                kokkos_shared_live_blocks, &
+                                kokkos_shared_unknown_releases, &
+                                kokkos_shared_fields_by_default, &
+                                kokkos_shared_default_for_setting, &
+                                kokkos_shared_token_issued
 
   use funit
 
@@ -176,5 +184,276 @@ contains
     @assertEqual(0_i_long, kokkos_shared_bytes())
 
   end subroutine test_accounting_is_absent_without_kokkos
+
+  !> Test that releasing a claimed block gives it back to the registry.
+  !>
+  !> @details This is the whole of the lifetime change in one case: before it,
+  !>          a claimed block was held until kokkos_shared_release_all at
+  !>          shutdown, so the live count only ever rose. The count is read
+  !>          before and after rather than compared with zero, because the
+  !>          registry is module state shared with every other case in this
+  !>          file.
+  !>
+  @test
+  subroutine test_release_of_a_claimed_block_drops_the_count( )
+
+    implicit none
+
+    real(real64), pointer :: array( : ) => null()
+    integer(i_def)        :: before
+    logical(l_def)        :: released
+
+    before = kokkos_shared_live_blocks()
+
+    call kokkos_shared_claim( array, 64_i_def )
+
+    @assertTrue(associated(array))
+    @assertEqual(64_i_def, int(size(array), i_def))
+    @assertEqual(before + 1_i_def, kokkos_shared_live_blocks())
+
+    array(:) = 7.0_real64
+
+    released = kokkos_shared_release( array )
+
+    @assertTrue(released)
+    @assertFalse(associated(array))
+    @assertEqual(before, kokkos_shared_live_blocks())
+
+  end subroutine test_release_of_a_claimed_block_drops_the_count
+
+  !> Test that releasing a pointer the registry never issued changes nothing.
+  !>
+  !> @details The counter this increments is the design's second detector: a
+  !>          shallow copy of a field the copy rule missed would release a
+  !>          block its original had already released, and the only place that
+  !>          can show up is here. So the case asserts three things -- the
+  !>          answer, that the caller's own storage is untouched, and that the
+  !>          count moved by exactly one.
+  !>
+  @test
+  subroutine test_release_of_an_unknown_pointer_is_counted( )
+
+    implicit none
+
+    real(real64), pointer :: mine( : ) => null()
+    integer(i_def)        :: before_live, before_unknown
+    logical(l_def)        :: released
+
+    allocate( mine(8) )
+    mine(:) = 3.0_real64
+
+    before_live    = kokkos_shared_live_blocks()
+    before_unknown = kokkos_shared_unknown_releases()
+
+    released = kokkos_shared_release( mine )
+
+    @assertFalse(released)
+    @assertTrue(associated(mine))
+    @assertEqual(8_i_def, int(size(mine), i_def))
+    @assertEqual(3.0_real64, mine(1))
+    @assertEqual(before_live, kokkos_shared_live_blocks())
+    @assertEqual(before_unknown + 1_i_def, kokkos_shared_unknown_releases())
+
+    deallocate( mine )
+
+  end subroutine test_release_of_an_unknown_pointer_is_counted
+
+  !> Test that a release presenting the wrong token is refused.
+  !>
+  !> @details The address is the registry's fast way of finding an entry, and
+  !>          on its own it is not proof of ownership: an object finalised
+  !>          after its storage stopped being a live field reads a pointer
+  !>          that may name an address the registry has since issued to
+  !>          somebody else, and freeing it would take a block away from a
+  !>          field still using it. The token is what makes the claim and the
+  !>          release one transaction. The case asserts that the wrong token
+  !>          leaves the block alone and is counted, and that the right one
+  !>          still works afterwards.
+  !>
+  @test
+  subroutine test_release_with_the_wrong_token_is_refused( )
+
+    implicit none
+
+    real(real64), pointer :: array( : ) => null()
+    integer(i_def)        :: token
+    integer(i_def)        :: before_live, before_unknown
+    logical(l_def)        :: released
+
+    before_live    = kokkos_shared_live_blocks()
+    before_unknown = kokkos_shared_unknown_releases()
+
+    call kokkos_shared_claim( array, 16_i_def, token = token )
+    array(:) = 5.0_real64
+
+    @assertTrue(token > 0_i_def)
+
+    released = kokkos_shared_release( array, token = token + 1000_i_def )
+
+    @assertFalse(released)
+    @assertTrue(associated(array))
+    @assertEqual(5.0_real64, array(1))
+    @assertEqual(before_live + 1_i_def, kokkos_shared_live_blocks())
+    @assertEqual(before_unknown + 1_i_def, kokkos_shared_unknown_releases())
+
+    released = kokkos_shared_release( array, token = token )
+
+    @assertTrue(released)
+    @assertFalse(associated(array))
+    @assertEqual(before_live, kokkos_shared_live_blocks())
+
+  end subroutine test_release_with_the_wrong_token_is_refused
+
+  !> Test that only a serial number this run issued is called issued.
+  !>
+  !> @details This is how an object about to release asks whether it is a
+  !>          field at all. A finaliser runs on whatever memory it is pointed
+  !>          at, and a type holding a field by value in memory that was
+  !>          never initialised reads a claimed flag and a token out of what
+  !>          happened to be there; the registry never reuses a serial
+  !>          number and never issues zero, so a value outside the range it
+  !>          has issued did not come from a claim. The case asserts the two
+  !>          ends -- zero and a number far past the last one issued -- and
+  !>          that a token just issued is recognised.
+  !>
+  @test
+  subroutine test_only_an_issued_token_is_called_issued( )
+
+    implicit none
+
+    real(real64), pointer :: array( : ) => null()
+    integer(i_def)        :: token
+    logical(l_def)        :: released
+
+    @assertFalse(kokkos_shared_token_issued( 0_i_def ))
+    @assertFalse(kokkos_shared_token_issued( -1_i_def ))
+
+    call kokkos_shared_claim( array, 16_i_def, token = token )
+
+    @assertTrue(kokkos_shared_token_issued( token ))
+    @assertFalse(kokkos_shared_token_issued( token + 1000000_i_def ))
+
+    released = kokkos_shared_release( array, token = token )
+
+    ! A token stays issued after its block has gone back: what it says is
+    ! that a claim was once made under it, which is what a copy of a live
+    ! field carries and garbage does not.
+    @assertTrue(released)
+    @assertTrue(kokkos_shared_token_issued( token ))
+
+  end subroutine test_only_an_issued_token_is_called_issued
+
+  !> Test that a released block is not released a second time at shutdown.
+  !>
+  !> @details A registry that forgot to remove the released entry would free
+  !>          the same block twice here, which is memory corruption rather than
+  !>          a wrong answer: the assertion this case can make is the block
+  !>          count, and the evidence it is not corrupt is that the executable
+  !>          reaches the end of the run at all. The second block is claimed so
+  !>          that the release is of an interior entry rather than of the only
+  !>          one, which is the case a swap-remove can get wrong.
+  !>
+  @test
+  subroutine test_release_then_release_all_frees_nothing_twice( )
+
+    implicit none
+
+    real(real64),   pointer :: first( : )  => null()
+    integer(int32), pointer :: second( : ) => null()
+    integer(i_def)          :: before
+    logical(l_def)          :: released
+
+    before = kokkos_shared_live_blocks()
+
+    call kokkos_shared_claim( first, 32_i_def )
+    call kokkos_shared_claim( second, 16_i_def )
+
+    @assertEqual(before + 2_i_def, kokkos_shared_live_blocks())
+
+    released = kokkos_shared_release( first )
+
+    @assertTrue(released)
+    @assertEqual(before + 1_i_def, kokkos_shared_live_blocks())
+
+    call kokkos_shared_release_all()
+
+    @assertEqual(0_i_def, kokkos_shared_live_blocks())
+
+  end subroutine test_release_then_release_all_frees_nothing_twice
+
+  !> Test that a claim of length zero never reaches the registry.
+  !>
+  !> @details ASSOCIATED(p, t) is false for zero-sized arrays (F2018 16.9.16),
+  !>          so a zero-length block could be put into the registry and never
+  !>          found there again. It is therefore not registered at all, and its
+  !>          release takes the ordinary DEALLOCATE route: it returns true and
+  !>          must not be counted as an unknown release, which would make the
+  !>          shutdown report accuse a copy that does not exist.
+  !>
+  @test
+  subroutine test_zero_length_claim_is_not_registered( )
+
+    implicit none
+
+    real(real64), pointer :: array( : ) => null()
+    integer(i_def)        :: before_live, before_unknown
+    logical(l_def)        :: released
+
+    before_live    = kokkos_shared_live_blocks()
+    before_unknown = kokkos_shared_unknown_releases()
+
+    call kokkos_shared_claim( array, 0_i_def )
+
+    @assertTrue(associated(array))
+    @assertEqual(0_i_def, int(size(array), i_def))
+    @assertEqual(before_live, kokkos_shared_live_blocks())
+
+    released = kokkos_shared_release( array )
+
+    @assertTrue(released)
+    @assertFalse(associated(array))
+    @assertEqual(before_live, kokkos_shared_live_blocks())
+    @assertEqual(before_unknown, kokkos_shared_unknown_releases())
+
+  end subroutine test_zero_length_claim_is_not_registered
+
+  !> Test that fields are not claimed from shared space in this build.
+  !>
+  !> @details field_mod.t90 templates to lowercase .f90 and so cannot see
+  !>          USE_KOKKOS (playbook lesson 33); it asks this module instead. The
+  !>          unit-test suite is built without the macro, so the answer here
+  !>          must be false -- which is also the assertion that a Fortran-only
+  !>          build still allocates its field data the way it always did.
+  !>
+  @test
+  subroutine test_fields_are_shared_by_default_only_with_kokkos( )
+
+    implicit none
+
+    @assertFalse(kokkos_shared_fields_by_default())
+
+  end subroutine test_fields_are_shared_by_default_only_with_kokkos
+
+  !> Test that the environment switch turns the default off.
+  !>
+  !> @details kokkos_shared_fields_by_default reads
+  !>          LFRIC_KOKKOS_SHARED_FIELDS once and then decides; the decision
+  !>          itself is kokkos_shared_default_for_setting, which is what this
+  !>          case exercises, because a Fortran unit test cannot set an
+  !>          environment variable for the process it is running in. That the
+  !>          variable is read at all is shown by the model gate, which runs a
+  !>          Kokkos binary with it set to 0 and gets a peak of no blocks.
+  !>
+  @test
+  subroutine test_the_environment_switch_turns_the_default_off( )
+
+    implicit none
+
+    @assertFalse(kokkos_shared_default_for_setting('0'))
+    @assertFalse(kokkos_shared_default_for_setting('0   '))
+    @assertTrue(kokkos_shared_default_for_setting('') .eqv. kokkos_shared_default_for_setting('1'))
+    @assertTrue(kokkos_shared_default_for_setting('') .eqv. kokkos_shared_fields_by_default())
+
+  end subroutine test_the_environment_switch_turns_the_default_off
 
 end module kokkos_memory_mod_test

@@ -30,7 +30,7 @@
 
 #include <cstddef>
 #include <cstdio>
-#include <unordered_set>
+#include <unordered_map>
 
 // Kokkos_Core_fwd.hpp defines has_shared_space true in every configuration that
 // resolves the SharedSpace alias, and leaves it false for OpenACC and
@@ -48,14 +48,23 @@ std::size_t live_bytes = 0;
 std::size_t peak_bytes = 0;
 std::size_t live_blocks = 0;
 
-// Every pointer the allocator has issued and not yet reclaimed. This exists so
+// Every pointer the allocator has issued and not yet reclaimed, against the
+// index of the Fortran registry entry that owns it. The set of keys exists so
 // that the free below can answer "did I allocate this?" per pointer. The
 // allocator falls back to returning nullptr when the runtime is not up, so a
 // run may legitimately hold a mixture of shared-space arrays and ordinary
 // Fortran ALLOCATEd ones, and freeing either of them the other way round is
 // memory corruption. No flag on the run as a whole can separate them, because
 // the property belongs to each array.
-std::unordered_set<void *> issued;
+//
+// The value is carried so that kokkos_memory_mod can release one block by
+// address in constant time rather than by scanning its registry. It is a
+// one-based Fortran index, and zero means "issued, but no registry entry owns
+// it" -- the state of every block that came from kokkos_shared_allocate
+// rather than from kokkos_shared_claim. The map is the only index: a block
+// that fell back to Fortran ALLOCATE never appears here, and the Fortran side
+// scans for those.
+std::unordered_map<void *, std::size_t> issued;
 
 }  // namespace
 
@@ -74,7 +83,7 @@ extern "C" void *lfric_kokkos_shared_allocate(std::size_t nbytes)
 
   void *pointer = Kokkos::kokkos_malloc<Kokkos::SharedSpace>(nbytes);
   if (pointer != nullptr) {
-    issued.insert(pointer);
+    issued[pointer] = 0;
     live_bytes += nbytes;
     live_blocks += 1;
     if (live_bytes > peak_bytes) {
@@ -104,6 +113,39 @@ extern "C" int lfric_kokkos_shared_free(void *pointer, std::size_t nbytes)
   live_bytes -= nbytes;
   live_blocks -= 1;
   return 1;
+}
+
+// Returns the one-based registry index recorded against a pointer, or zero if
+// this allocator did not issue it or no registry entry owns it. A caller
+// cannot tell those two apart from the answer, and does not need to: both
+// mean "not findable here, look elsewhere".
+extern "C" std::size_t lfric_kokkos_shared_index(void *pointer)
+{
+  if (pointer == nullptr) {
+    return 0;
+  }
+
+  const auto found = issued.find(pointer);
+  if (found == issued.end()) {
+    return 0;
+  }
+  return found->second;
+}
+
+// Records the one-based registry index owning a pointer, doing nothing if this
+// allocator did not issue it. Called when a block is claimed, and again when a
+// release moves the registry's last entry into the hole the released block
+// left, which changes that entry's index.
+extern "C" void lfric_kokkos_shared_set_index(void *pointer, std::size_t index)
+{
+  if (pointer == nullptr) {
+    return;
+  }
+
+  const auto found = issued.find(pointer);
+  if (found != issued.end()) {
+    found->second = index;
+  }
 }
 
 extern "C" std::size_t lfric_kokkos_shared_bytes()

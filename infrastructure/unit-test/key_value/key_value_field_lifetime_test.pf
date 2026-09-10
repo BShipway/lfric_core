@@ -1,0 +1,208 @@
+!-----------------------------------------------------------------------------
+! (C) Crown copyright 2026 Met Office. All rights reserved.
+! The file LICENCE, distributed with this code, contains details of the terms
+! under which the code may be used.
+!-----------------------------------------------------------------------------
+
+!> Test what a key-value collection does to an object that holds a field.
+!>
+!> @details A key-value collection stores objects derived from
+!>          abstract_value_type, and GungHo puts its timestep method -- which
+!>          holds five fields by value -- into one. A field's data is a block
+!>          it owns and gives back when it is finalised, held through a
+!>          pointer, so every copy of such an object names one block and each
+!>          copy would give it back.
+!>
+!>          The route into the collection used to make three copies and
+!>          destroy two of them: create_key_value copied the value into a
+!>          local pair, copied the pair into the object it returned, the list
+!>          copied that again, and both the local and the returned pair were
+!>          then destroyed. The block the collection and the caller were both
+!>          still using was given back during initialisation. The model showed
+!>          it as five refused releases at the end of solver initialisation
+!>          and a corrupted heap in timestep one.
+!>
+!>          A pair now goes into the list empty and is filled in place, so
+!>          exactly one copy is made and the collection is its only owner.
+!>          These cases measure that: the add claims nothing and releases
+!>          nothing, and clearing the collection gives the block back once,
+!>          with no release refused.
+!>
+module key_value_field_lifetime_test
+
+  use constants_mod,                 only : i_def, r_def, l_def
+  use field_real64_mod,              only : field_real64_type
+  use fs_continuity_mod,             only : W0
+  use function_space_mod,            only : function_space_type
+  use function_space_collection_mod, only : function_space_collection_type, &
+                                            function_space_collection
+  use halo_comms_mod,                only : initialise_halo_comms, &
+                                            finalise_halo_comms
+  use halo_routing_collection_mod,   only : halo_routing_collection_type, &
+                                            halo_routing_collection
+  use key_value_collection_mod,      only : key_value_collection_type
+  use key_value_mod,                 only : abstract_value_type
+  use kokkos_memory_mod,             only : kokkos_shared_live_blocks, &
+                                            kokkos_shared_unknown_releases
+  use lfric_mpi_mod,                 only : global_mpi, lfric_comm_type
+  use local_mesh_mod,                only : local_mesh_type
+  use mesh_collection_mod,           only : mesh_collection_type, &
+                                            mesh_collection
+  use mesh_mod,                      only : mesh_type
+  use pfunit
+
+  implicit none
+
+  private
+  public :: test_a_collected_object_is_the_only_owner_of_its_block
+  !
+  ! pFUnit depends on symbol scope spillover to work:
+  !
+  public MPITestCase, MPITestParameter
+
+  !> An object a key-value collection can hold that owns a field, as the
+  !> semi-implicit timestep method does.
+  type, extends(abstract_value_type), public :: field_holding_value_type
+    type(field_real64_type) :: held
+  end type field_holding_value_type
+
+@TestCase
+  type, extends(MPITestCase), public :: key_value_lifetime_test_type
+    private
+    type(function_space_type), pointer :: w0_fs => null()
+    type(local_mesh_type)              :: unit_test_local_mesh
+    type(mesh_type), pointer           :: mesh => null()
+  contains
+    procedure setUp
+    procedure tearDown
+    procedure get_local_mesh_ptr
+  end type key_value_lifetime_test_type
+
+  integer(i_def), parameter :: element_order_h = 0
+  integer(i_def), parameter :: element_order_v = 0
+
+contains
+
+  !> @brief Builds the one mesh and function space every case here needs.
+  !> @param [in,out] this   The test case.
+  subroutine setUp( this )
+
+    use mesh_mod, only : mesh_type, PLANE_BI_PERIODIC
+
+    implicit none
+
+    class(key_value_lifetime_test_type), intent(inout) :: this
+
+    type(local_mesh_type), pointer :: unit_test_local_mesh_ptr
+    type(mesh_type)                :: unit_test_mesh
+    integer(i_def)                 :: mesh_id
+    type(lfric_comm_type)          :: lfric_comm
+
+    call lfric_comm%set_comm_mpi_val(this%getMpiCommunicator())
+
+    call global_mpi%initialise(lfric_comm)
+    call initialise_halo_comms(lfric_comm)
+
+    mesh_collection = mesh_collection_type()
+    function_space_collection = function_space_collection_type()
+    halo_routing_collection = halo_routing_collection_type()
+
+    call this%unit_test_local_mesh%initialise()
+    unit_test_local_mesh_ptr => this%get_local_mesh_ptr()
+
+    unit_test_mesh = mesh_type( PLANE_BI_PERIODIC, unit_test_local_mesh_ptr )
+    mesh_id = mesh_collection%add_new_mesh( unit_test_mesh )
+    this%mesh => mesh_collection%get_mesh( mesh_id )
+
+    this%w0_fs => function_space_collection%get_fs( this%mesh,        &
+                                                    element_order_h,  &
+                                                    element_order_v,  &
+                                                    W0 )
+
+  end subroutine setUp
+
+  !> @brief Takes down the collections and the communicator the fixture built.
+  !> @param [in,out] this   The test case.
+  subroutine tearDown( this )
+
+    implicit none
+
+    class(key_value_lifetime_test_type), intent(inout) :: this
+
+    call function_space_collection%clear()
+    call mesh_collection%clear()
+
+    call finalise_halo_comms()
+    call global_mpi%finalise()
+
+  end subroutine tearDown
+
+  !> @brief Returns a pointer to the fixture's local mesh.
+  !> @param [in,out] this   The test case.
+  !> @return unit_test_local_mesh_ptr   The fixture's local mesh.
+  function get_local_mesh_ptr(this) result(unit_test_local_mesh_ptr)
+
+    implicit none
+
+    class(key_value_lifetime_test_type), intent(inout), target :: this
+    type(local_mesh_type), pointer :: unit_test_local_mesh_ptr
+
+    unit_test_local_mesh_ptr => this%unit_test_local_mesh
+
+  end function get_local_mesh_ptr
+
+  !> @brief Measures a collection taking one copy of an object holding a
+  !>        field, and being that block's only owner afterwards.
+  !> @details The object is allocated through a pointer and deliberately never
+  !>          deallocated, which is what GungHo does with its timestep method:
+  !>          the collection's copy is the one the model reads and the one
+  !>          that gives the block back. Adding it must claim nothing and
+  !>          release nothing; clearing the collection must give the one block
+  !>          back and refuse nothing.
+  !> @param [in,out] this   The test case.
+  @Test( npes=[1] )
+  subroutine test_a_collected_object_is_the_only_owner_of_its_block( this )
+
+    implicit none
+
+    class(key_value_lifetime_test_type), intent(inout) :: this
+
+    type(field_holding_value_type), pointer :: handed_over => null()
+    type(key_value_collection_type)         :: collection
+    integer(i_def) :: before, after_claim, after_add, after_clear
+    integer(i_def) :: unknown_before, unknown_after
+
+    before = kokkos_shared_live_blocks()
+    unknown_before = kokkos_shared_unknown_releases()
+
+    allocate( handed_over )
+    call handed_over%held%initialise( this%w0_fs,      &
+                                      name='held',     &
+                                      shared_data=.true._l_def )
+
+    after_claim = kokkos_shared_live_blocks()
+    @assertEqual(before + 1_i_def, after_claim)
+
+    call collection%initialise( 'lifetime_test' )
+    call collection%add_key_value( 'held_object', handed_over )
+
+    ! The collection's copy of the object names the block the original
+    ! claimed. Nothing new is claimed, and -- this is what the route used to
+    ! get wrong -- nothing is given back while the collection is still using
+    ! it.
+    after_add = kokkos_shared_live_blocks()
+    @assertEqual(after_claim, after_add)
+
+    call collection%clear()
+
+    ! The collection held the only object that would release the block, so
+    ! clearing it gives the block back exactly once.
+    after_clear = kokkos_shared_live_blocks()
+    @assertEqual(before, after_clear)
+
+    unknown_after = kokkos_shared_unknown_releases()
+    @assertEqual(unknown_before, unknown_after)
+
+  end subroutine test_a_collected_object_is_the_only_owner_of_its_block
+
+end module key_value_field_lifetime_test

@@ -269,7 +269,10 @@ subroutine insert_item(self, new_data, insert_point, placement)
 
   ! Allocate new item
   allocate(new_item)
-  allocate(new_item%payload, source=new_data)
+  ! The payload copies itself rather than being copied by SOURCE= here, so
+  ! that a payload owning storage through a pointer gives the list storage of
+  ! its own. See linked_list_data_mod's clone.
+  call new_data%clone(new_item%payload)
 
   if (.not. associated(self%current)) then
     ! Nothing in the linked list so add the first item

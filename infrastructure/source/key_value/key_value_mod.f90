@@ -196,6 +196,8 @@ module key_value_mod
     class(abstract_value_type), allocatable :: value
   contains
     procedure :: initialise => init_abstract_key_value
+    procedure :: set_value  => set_abstract_key_value
+    procedure :: clone      => clone_abstract_key_value
   end type abstract_key_value_type
 
 contains
@@ -229,7 +231,6 @@ function create_key_value_sca( key, value ) result(instance)
   type(real64_key_value_type)   :: concrete_real64
   type(logical_key_value_type)  :: concrete_logical
   type(str_key_value_type)      :: concrete_str
-  type(abstract_key_value_type) :: abstract_object
 
   select type (value)
 
@@ -258,8 +259,17 @@ function create_key_value_sca( key, value ) result(instance)
     allocate( instance, source=concrete_str )
 
   class is (abstract_value_type)
-    call abstract_object%initialise( key, value )
-    allocate( instance, source=abstract_object )
+    ! Built where it will live rather than in a local that is then copied by
+    ! SOURCE=. The value may hold an LFRic field, whose data is a block the
+    ! field gives back when it is finalised; a copy taken into a local
+    ! duplicates the pointer and not the block, and the local's destruction
+    ! at the end of this function would give back a block the copy is still
+    ! using. See set_abstract_key_value.
+    allocate( abstract_key_value_type :: instance )
+    select type ( instance )
+    type is ( abstract_key_value_type )
+      call instance%initialise( key, value )
+    end select
 
   class default
     write( log_scratch_space, &
@@ -608,9 +618,94 @@ subroutine init_abstract_key_value( self, key, value )
 
   call self%key_value_initialise( key )
 
-  allocate(self%value, source=value)
+  call self%set_value( value )
 
   return
 end subroutine init_abstract_key_value
+
+!> @brief Gives the pair the value it is to hold.
+!>
+!> @details This is the one copy of the value that is ever made, and it is
+!>          made straight into the pair that will keep it. That matters
+!>          because a type derived from abstract_value_type may hold an LFRic
+!>          field by value, and a field holds its data through a pointer to a
+!>          block it owns and gives back when it is finalised. ALLOCATE with
+!>          SOURCE= copies the pointer and not the block, so every extra copy
+!>          of such a value is another object that would give the same block
+!>          back. Splitting the value out of initialise lets
+!>          key_value_collection_mod put an empty pair into its list -- which
+!>          copies the pair -- and fill it afterwards, so that no copy of the
+!>          value is ever made into an object that is about to be destroyed.
+!>
+!> @param [in] value  The value to copy into the pair.
+subroutine set_abstract_key_value( self, value )
+
+  implicit none
+
+  class(abstract_key_value_type), intent(inout) :: self
+
+  class(abstract_value_type), intent(in) :: value
+
+  if ( allocated(self%value) ) then
+    call log_event( 'Key-value pair already holds a value', LOG_LEVEL_ERROR )
+  end if
+
+  ! This copies a value that may own storage through a pointer -- an
+  ! extension of abstract_value_type is free to hold an LFRic field, and a
+  ! field holds its data through a pointer to a block it gives back when it
+  ! is finalised. SOURCE= copies that pointer and not the block, so the pair
+  ! and the caller's object would both name the one block.
+  !
+  ! What makes that safe here is a contract and not the type: the value a
+  ! caller hands to add_key_value belongs to the collection from this point
+  ! on, and the caller must never destroy the original. A reader is given a
+  ! pointer into the collection rather than a copy. Every caller in this
+  ! model keeps that -- the timestep object is a pointer that is never
+  ! deallocated -- so no block is released twice.
+  !
+  ! The convention is load-bearing and nothing enforces it. The Kokkos
+  ! prototype's copy census (bin/census-field-copies in psy-ir-aidev)
+  ! allowlists this one site and warns about it on every run, and the
+  ! registry's unknown-release count is the run-time detector behind it.
+  ! The intended repair is upstream and is not made here: give
+  ! abstract_value_type a deferred clone, so that the copy the collection
+  ! keeps owns its own storage and no caller has to know this rule.
+  allocate(self%value, source=value)
+
+  return
+end subroutine set_abstract_key_value
+
+!> @brief Makes the copy a container keeps of this pair.
+!>
+!> @details A linked list stores a copy of what it is given and asks the
+!>          payload to make it (linked_list_data_mod's clone). The default
+!>          copies by SOURCE=, which is right for a pair holding nothing, and
+!>          wrong for one already holding a value that owns storage through a
+!>          pointer: the copy and the original would name one block and each
+!>          would give it back. No deep copy of an arbitrary
+!>          abstract_value_type exists -- the type has no copy protocol -- so
+!>          rather than make a copy that cannot be right, a pair is expected
+!>          to be inserted empty and filled afterwards through set_value,
+!>          which is what key_value_collection_mod does. Inserting a full one
+!>          is refused here instead of becoming a double release later.
+!>
+!> @param [out] copy  A newly allocated copy of this pair.
+subroutine clone_abstract_key_value( self, copy )
+
+  implicit none
+
+  class(abstract_key_value_type), intent(in)         :: self
+  class(linked_list_data_type), pointer, intent(out) :: copy
+
+  if ( allocated(self%value) ) then
+    call log_event( 'A key-value pair holding an object cannot be copied '// &
+                    'into a collection: insert it empty and set its value',  &
+                    LOG_LEVEL_ERROR )
+  end if
+
+  allocate( copy, source=self )
+
+  return
+end subroutine clone_abstract_key_value
 
 end module key_value_mod

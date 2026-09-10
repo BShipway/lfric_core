@@ -68,6 +68,8 @@ module inventory_by_mesh_mod
     ! Generic routines -- the same between different types of inventory
     procedure, public :: initialise
     procedure, public :: add_paired_object
+    !> Routine a container calls to have the inventory copy itself
+    procedure, public :: clone
     procedure, public :: get_length
     procedure, public :: get_name
     procedure, public :: get_table_len
@@ -234,6 +236,43 @@ subroutine add_paired_object(self, paired_object)
   call log_event(log_scratch_space, LOG_LEVEL_DEBUG)
 
 end subroutine add_paired_object
+
+!> @brief Makes a copy of this inventory for a container to keep.
+!>
+!> @details No deep copy of an inventory exists. A shallow one -- which is
+!>          what the linked list used to make of every payload -- copies the
+!>          hash table's list heads by copying their pointers, so the copy and
+!>          the original hold the same paired objects, each of which holds
+!>          field data that would then be released twice. An empty inventory
+!>          has nothing to share and is copied as it stands; a populated one
+!>          is a defect at the call site, and saying so is better than the
+!>          double free that used to follow silently.
+!>
+!> @param[in] self   The inventory to copy.
+!> @param[out] copy  A newly allocated, and necessarily empty, inventory.
+subroutine clone(self, copy)
+
+  implicit none
+
+  class(inventory_by_mesh_type), intent(in)  :: self
+  class(linked_list_data_type), pointer, intent(out) :: copy
+
+  if ( allocated(self%paired_object_list) ) then
+    if ( self%get_length() > 0 ) then
+      write( log_scratch_space, '(2A)' )                                     &
+          'Cannot copy a populated inventory into a container. Inventory: ', &
+          trim(self%name)
+      call log_event( log_scratch_space, LOG_LEVEL_ERROR )
+    end if
+  end if
+
+  ! The default clone of linked_list_data_mod, reproduced because Fortran
+  ! gives an override no way to call the binding it replaces. Correct here
+  ! only because of the check above: this object owns nothing by pointer once
+  ! it is known to be empty.
+  allocate( copy, source=self )
+
+end subroutine clone
 
 !> @brief Returns the number of entries in the inventory
 !> @return The number of entries in the inventory

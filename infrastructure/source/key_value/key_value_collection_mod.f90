@@ -180,12 +180,99 @@ subroutine create_key_value_object( self, key, value )
   class(*),                         intent(in)    :: value
 
   class(key_value_type), pointer :: instance
+  class(key_value_type), pointer :: stored
+  type(abstract_key_value_type)  :: empty_pair
 
-  instance => create_key_value( key, value )
-  call self%add_key_value_object( instance )
-  deallocate( instance )
+  select type (value)
+
+  class is (abstract_value_type)
+    ! An object derived from abstract_value_type may hold an LFRic field by
+    ! value, and a field holds its data in a block it owns and gives back
+    ! when it is finalised. Copying such an object copies the pointer and not
+    ! the block, so it must be copied exactly once, into whichever copy
+    ! outlives the rest.
+    !
+    ! Going through create_key_value here would not do that. It copies the
+    ! value into a pair, the pair is copied again when the list stores it,
+    ! and the pair this routine holds is then destroyed -- so the block the
+    ! stored copy and the caller are both still using is given back before
+    ! the first timestep, and given back a second time when this routine's
+    ! pair dies. That is what killed a shared-fields run: five refused
+    ! releases at the end of solver initialisation, from the five field
+    ! components of the semi-implicit timestep object as it was added here,
+    ! and a corrupted heap in timestep one.
+    !
+    ! Instead an empty pair goes into the list and the value is copied
+    ! straight into the pair the list now holds. That copy is the only one
+    ! made, and the stored pair is the only object that will release it.
+    call empty_pair%key_value_initialise( key )
+    call self%add_key_value_object( empty_pair )
+
+    stored => find_key_value( self, key )
+    if ( .not. associated(stored) ) then
+      write(log_scratch_space, '(4A)') &
+            'ERROR: add_key_value: pair with key: ', trim(key), &
+            ' was not found after being added to collection: ', trim(self%name)
+      call log_event( log_scratch_space, LOG_LEVEL_ERROR )
+    end if
+
+    select type (stored)
+    class is (abstract_key_value_type)
+      call stored%set_value( value )
+    class default
+      write(log_scratch_space, '(4A)') &
+            'ERROR: add_key_value: pair with key: ', trim(key), &
+            ' is not an object pair in collection: ', trim(self%name)
+      call log_event( log_scratch_space, LOG_LEVEL_ERROR )
+    end select
+
+  class default
+    ! Every other value is an intrinsic held by value. It owns nothing, so it
+    ! may be copied as often as the route through create_key_value copies it.
+    instance => create_key_value( key, value )
+    call self%add_key_value_object( instance )
+    deallocate( instance )
+
+  end select
 
 end subroutine create_key_value_object
+
+
+!> Find the key-value pair a key names, in the list its hash chooses
+!> @param [in] key The key of the pair being looked for
+!> @return found A pointer to the pair the collection holds, or a
+!>               disassociated pointer if it holds none under that key
+function find_key_value( self, key ) result( found )
+
+  implicit none
+
+  class(key_value_collection_type), intent(in) :: self
+  character(*),                     intent(in) :: key
+
+  class(key_value_type), pointer :: found
+
+  ! Pointer to linked list - used for looping through the list
+  type(linked_list_item_type), pointer :: loop => null()
+
+  found => null()
+
+  loop => self%key_value_list(self%get_hash(key))%get_head()
+
+  do
+    if ( .not. associated(loop) ) exit
+
+    select type(listitem => loop%payload)
+      class is (key_value_type)
+      if ( trim(key) == trim(listitem%get_key()) ) then
+        found => listitem
+        exit
+      end if
+    end select
+
+    loop => loop%next
+  end do
+
+end function find_key_value
 
 
 !> Check if a key-value pair is present in the collection
