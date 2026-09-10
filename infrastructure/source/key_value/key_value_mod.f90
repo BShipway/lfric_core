@@ -650,6 +650,26 @@ subroutine set_abstract_key_value( self, value )
     call log_event( 'Key-value pair already holds a value', LOG_LEVEL_ERROR )
   end if
 
+  ! This copies a value that may own storage through a pointer -- an
+  ! extension of abstract_value_type is free to hold an LFRic field, and a
+  ! field holds its data through a pointer to a block it gives back when it
+  ! is finalised. SOURCE= copies that pointer and not the block, so the pair
+  ! and the caller's object would both name the one block.
+  !
+  ! What makes that safe here is a contract and not the type: the value a
+  ! caller hands to add_key_value belongs to the collection from this point
+  ! on, and the caller must never destroy the original. A reader is given a
+  ! pointer into the collection rather than a copy. Every caller in this
+  ! model keeps that -- the timestep object is a pointer that is never
+  ! deallocated -- so no block is released twice.
+  !
+  ! The convention is load-bearing and nothing enforces it. The Kokkos
+  ! prototype's copy census (bin/census-field-copies in psy-ir-aidev)
+  ! allowlists this one site and warns about it on every run, and the
+  ! registry's unknown-release count is the run-time detector behind it.
+  ! The intended repair is upstream and is not made here: give
+  ! abstract_value_type a deferred clone, so that the copy the collection
+  ! keeps owns its own storage and no caller has to know this rule.
   allocate(self%value, source=value)
 
   return
