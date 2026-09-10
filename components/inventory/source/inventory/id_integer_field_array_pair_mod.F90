@@ -11,6 +11,7 @@ module id_integer_field_array_pair_mod
   use function_space_mod,    only: function_space_type
   use integer_field_mod,     only: integer_field_type
   use id_abstract_pair_mod,  only: id_abstract_pair_type
+  use linked_list_data_mod,  only: linked_list_data_type
 
   implicit none
 
@@ -32,6 +33,8 @@ module id_integer_field_array_pair_mod
 
     procedure, public :: initialise
     procedure, public :: copy_initialise
+    !> Routine a container calls to have the pair copy itself
+    procedure, public :: clone
     procedure, public :: get_field_array
 
     final :: destructor
@@ -92,6 +95,42 @@ contains
     call self%set_id(id)
 
   end subroutine copy_initialise
+
+  !> @brief Makes a copy of this pair for a container to keep.
+  !>
+  !> @details A pair is stored in an inventory's linked list, which used to
+  !>          copy its payload with ALLOCATE(..., SOURCE=). That copies each
+  !>          held field's data pointer rather than its data, so the stored
+  !>          pair and the caller's original named one block of shared space
+  !>          per field and the original released them. copy_initialise is
+  !>          the deep copy this type already has.
+  !>
+  !>          A pair whose array was never allocated has nothing to copy;
+  !>          copy_initialise cannot be asked for that, so such a pair is
+  !>          copied as it stands, which owns nothing.
+  !>
+  !> @param[in] self   The pair to copy.
+  !> @param[out] copy  A newly allocated pair holding copies of the fields.
+  subroutine clone(self, copy)
+
+    implicit none
+
+    class(id_integer_field_array_pair_type), intent(in) :: self
+    class(linked_list_data_type), pointer, intent(out) :: copy
+
+    type(id_integer_field_array_pair_type), pointer :: new_pair => null()
+
+    allocate( new_pair )
+
+    if ( allocated(self%field_array_) ) then
+      call new_pair%copy_initialise( self%field_array_, self%get_id() )
+    else
+      call new_pair%set_id( self%get_id() )
+    end if
+
+    copy => new_pair
+
+  end subroutine clone
 
   !> @brief Get the field_array corresponding to the paired object
   !> @param[in] self     The paired object

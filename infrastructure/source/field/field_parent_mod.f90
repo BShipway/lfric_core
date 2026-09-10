@@ -300,7 +300,14 @@ contains
     initialised = self%initialised
   end function is_initialised
 
-  ! Copy the contents of one field_parent_type to another
+  !> @brief Copy the contents of one field_parent_type to another.
+  !> @details This is the sanctioned copy of the parent's state, and it has to
+  !>          carry everything ALLOCATE(..., SOURCE=) used to carry, now that
+  !>          a field is copied only through initialise and this. cpl_id is
+  !>          the component that was missing: a COUPLED build would otherwise
+  !>          lose the OASIS ids of a field a collection had copied.
+  !> @param [in] self      The field parent to copy from.
+  !> @param [in,out] dest  The field parent to copy into.
   subroutine copy_field_parent(self, dest)
 
     implicit none
@@ -309,6 +316,11 @@ contains
 
     dest%field_halo_depth = self%field_halo_depth
     dest%halo_dirty(:)=self%halo_dirty(:)
+
+    if ( allocated(self%cpl_id) ) then
+      if ( allocated(dest%cpl_id) ) deallocate( dest%cpl_id )
+      allocate( dest%cpl_id, source=self%cpl_id )
+    end if
   end subroutine copy_field_parent
 
   ! Function to return the integer id of the function space from the field

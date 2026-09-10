@@ -28,7 +28,8 @@
 module driver_kokkos_mod
 
   use kokkos_memory_mod, only: kokkos_shared_release_all, &
-                               kokkos_shared_report
+                               kokkos_shared_report, &
+                               kokkos_shared_report_lifetime
 
   implicit none
 
@@ -77,16 +78,23 @@ contains
   !>
   !>          The shared-space high-water mark is then reported, to standard
   !>          error because gungho_model.f90 calls final_logger before
-  !>          final_kokkos and so has no logger left. Reporting after the
-  !>          release rather than before it is what makes the live figures a
-  !>          leak check: everything this run claimed has been given back by
-  !>          then, so a non-zero live count is a block claimed by something
-  !>          the registry did not see. The peak figures survive the release
-  !>          and are what say the storage was ever taken from shared space.
+  !>          final_kokkos and so has no logger left. There are two reports
+  !>          and they are on opposite sides of the release for opposite
+  !>          reasons. The lifetime line is read before it, where the live
+  !>          count still says how many blocks no field gave back -- the leak
+  !>          check, now that a field releases its own. The registry and
+  !>          allocator lines are read after it, where the peak figures
+  !>          survive and are what say the storage was ever taken from shared
+  !>          space at all.
   !>          Both must come before Kokkos::finalize, since the counters they
   !>          read live in a translation unit whose state means nothing after
   !>          it.
   subroutine final_kokkos()
+
+    ! Before the release, because afterwards the live count is zero by
+    ! construction. What it says here is how many blocks nothing gave back,
+    ! which is zero when every field that claimed one has been finalised
+    call kokkos_shared_report_lifetime()
 
     call kokkos_shared_release_all()
     call kokkos_shared_report()

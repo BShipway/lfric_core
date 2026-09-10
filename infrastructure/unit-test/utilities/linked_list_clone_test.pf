@@ -1,0 +1,314 @@
+!-----------------------------------------------------------------------------
+! (C) Crown copyright 2026 Met Office. All rights reserved.
+! The file LICENCE, distributed with this code, contains details of the terms
+! under which the code may be used.
+!-----------------------------------------------------------------------------
+
+!> Test that a linked list takes a copy of its payload rather than a shallow
+!> duplicate of it.
+!>
+!> @details linked_list_mod used to store a payload with
+!>          ALLOCATE(..., SOURCE=), which copies a pointer component by
+!>          copying the pointer. A field holding its values in shared space
+!>          holds them through such a pointer, so the stored payload and the
+!>          caller's local named one block between them, and the local's
+!>          finaliser gave that block back while the list was still using it.
+!>          The list now asks the payload to clone itself.
+!>
+!>          Every case here works in terms of the registry's live-block count,
+!>          because that is the observable that separates the two behaviours
+!>          without reading storage that the broken behaviour has freed. The
+!>          count is a module-wide total, so each case reads it before doing
+!>          anything and compares against that rather than against zero.
+!>
+module linked_list_clone_test
+
+  use, intrinsic :: iso_fortran_env, only : real64
+
+  use constants_mod,                 only : i_def, r_def, l_def
+  use field_collection_mod,          only : field_collection_type
+  use field_real64_mod,              only : field_real64_type, &
+                                            field_real64_proxy_type
+  use fs_continuity_mod,             only : W0
+  use function_space_mod,            only : function_space_type
+  use function_space_collection_mod, only : function_space_collection_type, &
+                                            function_space_collection
+  use halo_comms_mod,                only : initialise_halo_comms, &
+                                            finalise_halo_comms
+  use halo_routing_collection_mod,   only : halo_routing_collection_type, &
+                                            halo_routing_collection
+  use kokkos_memory_mod,             only : kokkos_shared_live_blocks
+  use lfric_mpi_mod,                 only : global_mpi, lfric_comm_type
+  use linked_list_mod,               only : linked_list_type, &
+                                            linked_list_item_type
+  use local_mesh_mod,                only : local_mesh_type
+  use mesh_collection_mod,           only : mesh_collection_type, &
+                                            mesh_collection
+  use mesh_mod,                      only : mesh_type
+  use pfunit
+
+  implicit none
+
+  private
+  public :: test_a_listed_field_outlives_the_local_it_came_from
+  public :: test_a_collected_field_outlives_the_local_it_came_from
+  public :: test_clearing_a_collection_gives_the_blocks_back
+  !
+  ! pFUnit depends on symbol scope spillover to work:
+  !
+  public MPITestCase, MPITestParameter
+
+  @TestCase
+  type, extends(MPITestCase), public :: linked_list_clone_test_type
+    private
+    type(function_space_type), pointer :: w0_fs => null()
+    type(local_mesh_type)              :: unit_test_local_mesh
+    type(mesh_type), pointer           :: mesh => null()
+  contains
+    procedure setUp
+    procedure tearDown
+    procedure get_local_mesh_ptr
+  end type linked_list_clone_test_type
+
+  integer(i_def), parameter :: element_order_h = 0
+  integer(i_def), parameter :: element_order_v = 0
+
+contains
+
+  !> @brief Builds the one mesh and function space every case here needs.
+  !> @param [in,out] this   The test case.
+  subroutine setUp( this )
+
+    use mesh_mod, only : mesh_type, PLANE_BI_PERIODIC
+
+    implicit none
+
+    class(linked_list_clone_test_type), intent(inout) :: this
+
+    type(local_mesh_type), pointer :: unit_test_local_mesh_ptr
+    type(mesh_type)                :: unit_test_mesh
+    integer(i_def)                 :: mesh_id
+    type(lfric_comm_type)          :: lfric_comm
+
+    call lfric_comm%set_comm_mpi_val(this%getMpiCommunicator())
+
+    call global_mpi%initialise(lfric_comm)
+    call initialise_halo_comms(lfric_comm)
+
+    mesh_collection = mesh_collection_type()
+    function_space_collection = function_space_collection_type()
+    halo_routing_collection = halo_routing_collection_type()
+
+    call this%unit_test_local_mesh%initialise()
+    unit_test_local_mesh_ptr => this%get_local_mesh_ptr()
+
+    unit_test_mesh = mesh_type( PLANE_BI_PERIODIC, unit_test_local_mesh_ptr )
+    mesh_id = mesh_collection%add_new_mesh( unit_test_mesh )
+    this%mesh => mesh_collection%get_mesh( mesh_id )
+
+    this%w0_fs => function_space_collection%get_fs( this%mesh,        &
+                                                    element_order_h,  &
+                                                    element_order_v,  &
+                                                    W0 )
+
+  end subroutine setUp
+
+  !> @brief Takes down the collections and the communicator the fixture built.
+  !> @param [in,out] this   The test case.
+  subroutine tearDown( this )
+
+    implicit none
+
+    class(linked_list_clone_test_type), intent(inout) :: this
+
+    call function_space_collection%clear()
+    call mesh_collection%clear()
+
+    call finalise_halo_comms()
+    call global_mpi%finalise()
+
+  end subroutine tearDown
+
+  !> @brief Returns a pointer to the fixture's local mesh.
+  !> @param [in,out] this   The test case.
+  !> @return unit_test_local_mesh_ptr   The fixture's local mesh.
+  function get_local_mesh_ptr(this) result(unit_test_local_mesh_ptr)
+
+    implicit none
+
+    class(linked_list_clone_test_type), intent(inout), target :: this
+    type(local_mesh_type), pointer :: unit_test_local_mesh_ptr
+
+    unit_test_local_mesh_ptr => this%unit_test_local_mesh
+
+  end function get_local_mesh_ptr
+
+  !> @brief Creates a shared field in a scope of its own and lists it.
+  !> @details The field is a local, so its finaliser runs on return. That is
+  !>          the whole point: what the list holds afterwards must not be
+  !>          storage this routine has given back.
+  !> @param [in,out] list   The list to insert into.
+  !> @param [in] fs         The function space the field lives on.
+  !> @param [in] name       The name to give the field.
+  !> @param [in] value      The value to put in the field's first dof.
+  subroutine list_a_shared_field( list, fs, name, value )
+
+    implicit none
+
+    type(linked_list_type),             intent(inout) :: list
+    type(function_space_type), pointer, intent(in)    :: fs
+    character(*),                       intent(in)    :: name
+    real(real64),                       intent(in)    :: value
+
+    type(field_real64_type)       :: field
+    type(field_real64_proxy_type) :: field_p
+
+    call field%initialise( fs, name=name, shared_data=.true._l_def )
+    field_p = field%get_proxy()
+    field_p%data(:) = value
+
+    call list%insert_item( field )
+
+  end subroutine list_a_shared_field
+
+  !> @brief Creates a shared field in a scope of its own and collects it.
+  !> @param [in,out] collection   The collection to add to.
+  !> @param [in] fs               The function space the field lives on.
+  !> @param [in] name             The name to give the field.
+  !> @param [in] value            The value to put in the field's first dof.
+  subroutine collect_a_shared_field( collection, fs, name, value )
+
+    implicit none
+
+    type(field_collection_type),        intent(inout) :: collection
+    type(function_space_type), pointer, intent(in)    :: fs
+    character(*),                       intent(in)    :: name
+    real(real64),                       intent(in)    :: value
+
+    type(field_real64_type)       :: field
+    type(field_real64_proxy_type) :: field_p
+
+    call field%initialise( fs, name=name, shared_data=.true._l_def )
+    field_p = field%get_proxy()
+    field_p%data(:) = value
+
+    call collection%add_field( field )
+
+  end subroutine collect_a_shared_field
+
+  !> Test that a listed field keeps a block of its own.
+  !>
+  !> @details Under the old shallow copy the count would be back where it
+  !>          started here, because the one block both objects named was
+  !>          returned by the local's finaliser -- and the values read out
+  !>          below would be read from freed storage. The count is asserted
+  !>          first for that reason.
+  !>
+  @Test( npes=[1] )
+  subroutine test_a_listed_field_outlives_the_local_it_came_from( test_case )
+
+    implicit none
+
+    class(linked_list_clone_test_type), intent(inout) :: test_case
+
+    type(linked_list_type)                   :: list
+    type(linked_list_item_type), pointer     :: item => null()
+    type(field_real64_proxy_type)            :: listed_p
+    integer(i_def)                           :: before
+
+    before = kokkos_shared_live_blocks()
+
+    list = linked_list_type()
+    call list_a_shared_field( list, test_case%w0_fs, 'listed', 42.0_real64 )
+
+    @assertEqual(before + 1_i_def, kokkos_shared_live_blocks())
+    @assertEqual(1_i_def, list%get_length())
+
+    item => list%get_tail()
+    select type ( payload => item%payload )
+      type is ( field_real64_type )
+        @assertEqual('listed', trim(payload%get_name()))
+        listed_p = payload%get_proxy()
+        @assertEqual(42.0_real64, listed_p%data(1))
+      class default
+        @assertTrue(.false.)
+    end select
+
+    call list%clear()
+
+    @assertEqual(before, kokkos_shared_live_blocks())
+
+  end subroutine test_a_listed_field_outlives_the_local_it_came_from
+
+  !> Test that a collected field keeps a block of its own.
+  !>
+  !> @details field_collection_mod stores through the same linked list, so
+  !>          this is the same property reached the way the model reaches it.
+  !>
+  @Test( npes=[1] )
+  subroutine test_a_collected_field_outlives_the_local_it_came_from( test_case )
+
+    implicit none
+
+    class(linked_list_clone_test_type), intent(inout) :: test_case
+
+    type(field_collection_type)           :: collection
+    type(field_real64_type), pointer      :: collected => null()
+    type(field_real64_proxy_type)         :: collected_p
+    integer(i_def)                        :: before
+
+    before = kokkos_shared_live_blocks()
+
+    call collection%initialise( name='clone_test', table_len=1_i_def )
+    call collect_a_shared_field( collection, test_case%w0_fs,               &
+                                 'collected', 17.0_real64 )
+
+    @assertEqual(before + 1_i_def, kokkos_shared_live_blocks())
+
+    call collection%get_field( 'collected', collected )
+
+    @assertTrue(associated(collected))
+    @assertEqual('collected', trim(collected%get_name()))
+    collected_p = collected%get_proxy()
+    @assertEqual(17.0_real64, collected_p%data(1))
+
+    call collection%clear()
+
+    @assertEqual(before, kokkos_shared_live_blocks())
+
+  end subroutine test_a_collected_field_outlives_the_local_it_came_from
+
+  !> Test that clearing a collection gives every block back.
+  !>
+  !> @details Two fields rather than one, so that the release is of an
+  !>          interior registry entry as well as of the last, and so that a
+  !>          registry that lost track of one of them shows a count of one
+  !>          rather than a count that happens to be right.
+  !>
+  @Test( npes=[1] )
+  subroutine test_clearing_a_collection_gives_the_blocks_back( test_case )
+
+    implicit none
+
+    class(linked_list_clone_test_type), intent(inout) :: test_case
+
+    type(field_collection_type) :: collection
+    integer(i_def)              :: before
+
+    before = kokkos_shared_live_blocks()
+
+    call collection%initialise( name='clone_test_two', table_len=1_i_def )
+    call collect_a_shared_field( collection, test_case%w0_fs,               &
+                                 'first', 1.0_real64 )
+    call collect_a_shared_field( collection, test_case%w0_fs,               &
+                                 'second', 2.0_real64 )
+
+    @assertEqual(before + 2_i_def, kokkos_shared_live_blocks())
+
+    call collection%clear()
+
+    @assertEqual(before, kokkos_shared_live_blocks())
+
+  end subroutine test_clearing_a_collection_gives_the_blocks_back
+
+end module linked_list_clone_test

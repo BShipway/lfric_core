@@ -56,6 +56,8 @@ module field_collection_mod
   contains
     procedure, public :: initialise
     procedure, public :: copy_collection
+    !> Routine a container calls to have the collection copy itself
+    procedure, public :: clone => field_collection_clone
     procedure, public :: add_field
     procedure, public :: add_reference_to_field
     procedure, public :: remove_field
@@ -656,6 +658,37 @@ subroutine copy_collection(self, dest, name)
   end if
 
 end subroutine copy_collection
+
+!> @brief Make a copy of this collection for a container to keep.
+!>
+!> @details A collection can itself be a payload of a linked list -- the
+!>          model's depository holds collections -- and the default clone
+!>          would copy it with ALLOCATE(..., SOURCE=), which copies the hash
+!>          table's list heads by copying their pointers. The copy and the
+!>          original would then hold the same field objects, and clearing
+!>          either would release the other's blocks. copy_collection is the
+!>          deep copy the type already has.
+!>
+!> @param [in] self   The collection to copy.
+!> @param [out] copy  A newly allocated collection holding copies of the
+!>                    same fields.
+subroutine field_collection_clone(self, copy)
+
+  implicit none
+
+  class(field_collection_type), intent(in)  :: self
+  class(linked_list_data_type), pointer, intent(out) :: copy
+
+  type(field_collection_type), pointer :: new_collection => null()
+
+  allocate( new_collection )
+
+  call self%copy_collection( new_collection, self%name )
+  call new_collection%set_id( self%get_id() )
+
+  copy => new_collection
+
+end subroutine field_collection_clone
 
 !> Clears all items from the field collection
 subroutine clear(self)

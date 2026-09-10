@@ -1,0 +1,196 @@
+!-----------------------------------------------------------------------------
+! (C) Crown copyright 2026 Met Office. All rights reserved.
+! The file LICENCE, distributed with this code, contains details of the terms
+! under which the code may be used.
+!-----------------------------------------------------------------------------
+
+!> Test what ALLOCATE(..., SOURCE=) does to a field held by value inside
+!> another type, when the source is a function result.
+!>
+!> @details The shape was argued to be safe -- the function result is not a
+!>          live object, so the block its field claimed would be owned by the
+!>          ALLOCATE's target alone -- and it is not: the compiler finalises
+!>          the function result after the copy, so the block goes back while
+!>          the target still points at it. This measures that, because it is
+!>          the reason bin/census-field-copies fails such a site, and because
+!>          a compiler that stopped doing it should be noticed rather than
+!>          assumed. It also measures the claim token refusing the target's
+!>          own release of a block it does not own.
+!>
+module field_source_copy_test
+
+  use, intrinsic :: iso_fortran_env, only : real64
+
+  use constants_mod,                 only : i_def, r_def, l_def
+  use field_real64_mod,              only : field_real64_type, &
+                                            field_real64_proxy_type
+  use fs_continuity_mod,             only : W0
+  use function_space_mod,            only : function_space_type
+  use function_space_collection_mod, only : function_space_collection_type, &
+                                            function_space_collection
+  use halo_comms_mod,                only : initialise_halo_comms, &
+                                            finalise_halo_comms
+  use halo_routing_collection_mod,   only : halo_routing_collection_type, &
+                                            halo_routing_collection
+  use kokkos_memory_mod,             only : kokkos_shared_live_blocks, &
+                                            kokkos_shared_unknown_releases
+  use lfric_mpi_mod,                 only : global_mpi, lfric_comm_type
+  use local_mesh_mod,                only : local_mesh_type
+  use mesh_collection_mod,           only : mesh_collection_type, &
+                                            mesh_collection
+  use mesh_mod,                      only : mesh_type
+  use pfunit
+
+  implicit none
+
+  private
+  public :: test_a_field_in_a_function_result_is_lost_by_source_copy
+  !
+  ! pFUnit depends on symbol scope spillover to work:
+  !
+  public MPITestCase, MPITestParameter
+
+  !> A type holding a field by value, as the preconditioner and timestepping
+  !> types in lfric_apps do.
+  type, public :: holder_type
+    type(field_real64_type) :: held
+  end type holder_type
+
+@TestCase
+  type, extends(MPITestCase), public :: source_copy_test_type
+    private
+    type(function_space_type), pointer :: w0_fs => null()
+    type(local_mesh_type)              :: unit_test_local_mesh
+    type(mesh_type), pointer           :: mesh => null()
+  contains
+    procedure setUp
+    procedure tearDown
+    procedure get_local_mesh_ptr
+  end type source_copy_test_type
+
+  integer(i_def), parameter :: element_order_h = 0
+  integer(i_def), parameter :: element_order_v = 0
+
+contains
+
+  !> @brief Builds the one mesh and function space every case here needs.
+  !> @param [in,out] this   The test case.
+  subroutine setUp( this )
+
+    use mesh_mod, only : mesh_type, PLANE_BI_PERIODIC
+
+    implicit none
+
+    class(source_copy_test_type), intent(inout) :: this
+
+    type(local_mesh_type), pointer :: unit_test_local_mesh_ptr
+    type(mesh_type)                :: unit_test_mesh
+    integer(i_def)                 :: mesh_id
+    type(lfric_comm_type)          :: lfric_comm
+
+    call lfric_comm%set_comm_mpi_val(this%getMpiCommunicator())
+
+    call global_mpi%initialise(lfric_comm)
+    call initialise_halo_comms(lfric_comm)
+
+    mesh_collection = mesh_collection_type()
+    function_space_collection = function_space_collection_type()
+    halo_routing_collection = halo_routing_collection_type()
+
+    call this%unit_test_local_mesh%initialise()
+    unit_test_local_mesh_ptr => this%get_local_mesh_ptr()
+
+    unit_test_mesh = mesh_type( PLANE_BI_PERIODIC, unit_test_local_mesh_ptr )
+    mesh_id = mesh_collection%add_new_mesh( unit_test_mesh )
+    this%mesh => mesh_collection%get_mesh( mesh_id )
+
+    this%w0_fs => function_space_collection%get_fs( this%mesh,        &
+                                                    element_order_h,  &
+                                                    element_order_v,  &
+                                                    W0 )
+
+  end subroutine setUp
+
+  !> @brief Takes down the collections and the communicator the fixture built.
+  !> @param [in,out] this   The test case.
+  subroutine tearDown( this )
+
+    implicit none
+
+    class(source_copy_test_type), intent(inout) :: this
+
+    call function_space_collection%clear()
+    call mesh_collection%clear()
+
+    call finalise_halo_comms()
+    call global_mpi%finalise()
+
+  end subroutine tearDown
+
+  !> @brief Returns a pointer to the fixture's local mesh.
+  !> @param [in,out] this   The test case.
+  !> @return unit_test_local_mesh_ptr   The fixture's local mesh.
+  function get_local_mesh_ptr(this) result(unit_test_local_mesh_ptr)
+
+    implicit none
+
+    class(source_copy_test_type), intent(inout), target :: this
+    type(local_mesh_type), pointer :: unit_test_local_mesh_ptr
+
+    unit_test_local_mesh_ptr => this%unit_test_local_mesh
+
+  end function get_local_mesh_ptr
+
+  !> @brief Builds a holder whose field claims a block, and returns it by
+  !>        value, as an overloaded structure constructor does.
+  !> @param [in] fs   The function space the field lives on.
+  !> @return self     A holder owning one claimed block.
+  function make_holder( fs ) result(self)
+
+    implicit none
+
+    type(function_space_type), pointer, intent(in) :: fs
+    type(holder_type) :: self
+
+    call self%held%initialise( fs, name='held', shared_data=.true._l_def )
+
+  end function make_holder
+
+  !> @brief Measures ALLOCATE(..., SOURCE=<function result>) losing the block
+  !>        the allocated holder points at.
+  !> @details One block is claimed by the function result. The compiler
+  !>          finalises that result after the copy, so the block is given back
+  !>          while the allocated holder still points at it and the live count
+  !>          returns to where it started. The holder's own release then
+  !>          presents a token the registry has retired, and is refused and
+  !>          counted rather than freeing memory a second time.
+  !> @param [in,out] this   The test case.
+  @Test( npes=[1] )
+  subroutine test_a_field_in_a_function_result_is_lost_by_source_copy( this )
+
+    implicit none
+
+    class(source_copy_test_type), intent(inout) :: this
+
+    type(holder_type), pointer :: kept => null()
+    integer(i_def) :: before, after, unknown_before, unknown_after
+
+    before = kokkos_shared_live_blocks()
+
+    allocate( kept, source=make_holder( this%w0_fs ) )
+
+    after = kokkos_shared_live_blocks()
+
+    @assertEqual(before, after)
+
+    unknown_before = kokkos_shared_unknown_releases()
+
+    deallocate( kept )
+
+    unknown_after = kokkos_shared_unknown_releases()
+
+    @assertEqual(unknown_before + 1_i_def, unknown_after)
+
+  end subroutine test_a_field_in_a_function_result_is_lost_by_source_copy
+
+end module field_source_copy_test

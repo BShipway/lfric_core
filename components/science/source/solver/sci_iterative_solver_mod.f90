@@ -889,7 +889,13 @@ contains
     allocate(v(self%gcrk))
 
     do iv = 1, self%gcrk
-      allocate(v(iv)%vt, source=x)
+      ! Duplicated rather than copied with SOURCE=, which would copy each
+      ! field's data pointer instead of its data and leave two vectors
+      ! sharing one block of shared space -- and each releasing it. duplicate
+      ! builds the fields through initialise, which is the only sanctioned
+      ! way to copy one. The values are not carried over and were not used:
+      ! these are workspace vectors, written before they are read.
+      call x%duplicate(v(iv)%vt)
     end do
 
     allocate( h(self%gcrk+1, self%gcrk) )
@@ -1120,8 +1126,14 @@ contains
     allocate(Pv(self%gcrk))
 
     do iv = 1, self%gcrk
-      allocate(Pv(iv)%vt, source=x)
-      allocate(v(iv)%vt, source=x)
+      ! Duplicated rather than copied with SOURCE=, which would copy each
+      ! field's data pointer instead of its data and leave two vectors
+      ! sharing one block of shared space -- and each releasing it. duplicate
+      ! builds the fields through initialise, which is the only sanctioned
+      ! way to copy one. The values are not carried over and were not used:
+      ! these are workspace vectors, written before they are read.
+      call x%duplicate(Pv(iv)%vt)
+      call x%duplicate(v(iv)%vt)
     end do
 
     call v(1)%vt%copy(s)
@@ -1347,8 +1359,14 @@ contains
     allocate(Pv(self%gcrk))
 
     do iv = 1, self%gcrk
-      allocate(Pv(iv)%vt, source=x)
-      allocate(v(iv)%vt, source=x)
+      ! Duplicated rather than copied with SOURCE=, which would copy each
+      ! field's data pointer instead of its data and leave two vectors
+      ! sharing one block of shared space -- and each releasing it. duplicate
+      ! builds the fields through initialise, which is the only sanctioned
+      ! way to copy one. The values are not carried over and were not used:
+      ! these are workspace vectors, written before they are read.
+      call x%duplicate(Pv(iv)%vt)
+      call x%duplicate(v(iv)%vt)
     end do
 
     ! initialisation complete, lets go to work.
@@ -1526,8 +1544,14 @@ contains
     allocate(Pv(self%gcrk))
 
     do iv = 1, self%gcrk
-      allocate(Pv(iv)%vt, source=x)
-      allocate(v(iv)%vt, source=x)
+      ! Duplicated rather than copied with SOURCE=, which would copy each
+      ! field's data pointer instead of its data and leave two vectors
+      ! sharing one block of shared space -- and each releasing it. duplicate
+      ! builds the fields through initialise, which is the only sanctioned
+      ! way to copy one. The values are not carried over and were not used:
+      ! these are workspace vectors, written before they are read.
+      call x%duplicate(Pv(iv)%vt)
+      call x%duplicate(v(iv)%vt)
     end do
 
     converged(:)=.false.

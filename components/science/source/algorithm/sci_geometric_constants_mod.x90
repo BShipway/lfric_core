@@ -1689,6 +1689,14 @@ contains
     call dz_at_wtheta_inventory%clear()
     call dA_msl_proj_inventory%clear()
 
+    ! The face selectors are module state like the rest and were the two this
+    ! routine did not name. It cost nothing while a field's storage was an
+    ! allocatable the process gave back on exit; a field claiming a block from
+    ! shared space gives it back when it is finalised, so an inventory nothing
+    ! clears is two blocks live at finalise for the whole run.
+    call face_selector_ew_inventory%clear()
+    call face_selector_ns_inventory%clear()
+
   end subroutine final_geometric_constants
 
 end module sci_geometric_constants_mod

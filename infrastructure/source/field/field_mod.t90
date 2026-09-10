@@ -32,7 +32,13 @@ module field_{{kind}}_mod
                                   perform_halo_exchange, &
                                   perform_halo_exchange_start, &
                                   perform_halo_exchange_finish
-  use kokkos_memory_mod,    only: kokkos_shared_claim
+  use kokkos_memory_mod,    only: kokkos_shared_claim, &
+                                 kokkos_shared_release, &
+                                 kokkos_shared_name_refusal, &
+                                 kokkos_shared_note_stale_finalisation, &
+                                 kokkos_shared_token_issued, &
+                                 kokkos_shared_fields_by_default
+  use linked_list_data_mod, only: linked_list_data_type
   use mesh_mod,             only: mesh_type
   use log_mod,              only: log_event, &
                                   log_scratch_space, &
@@ -70,10 +76,21 @@ module field_{{kind}}_mod
     {{type}}({{kind}}), pointer :: override_data( : )
     !> Whether override_data points at a block claimed from Kokkos shared
     !> space rather than at storage the application supplied. It says where
-    !> the data came from, not what it holds, and SOURCE= copies it along with
-    !> the pointer beside it -- which is right, because a copy of a shared
-    !> field reads the same shared block and so is shared too.
+    !> the data came from, not what it holds, and it is what field_final
+    !> consults to decide whether the block is this field's to give back. A
+    !> field may only be copied through initialise, so no two fields ever
+    !> have this set for one block.
     logical(l_def) :: data_is_shared = .false.
+    !> The serial number the registry issued this field's block under, and
+    !> the second half of what field_final presents to give it back. The
+    !> flag alone would be taken on trust, and the one thing this module
+    !> cannot trust is memory that is not a live field: an object finalised
+    !> after its storage has been reused reads a flag and a pointer that were
+    !> never written by initialise, and a pointer can name an address the
+    !> registry has since issued to a field that is still using it. A token
+    !> read from such memory matches no live claim, so the release is refused
+    !> rather than taken for that field's.
+    integer(i_def) :: shared_token = 0_i_def
 
     ! IO interface procedure pointers
 
@@ -88,6 +105,9 @@ module field_{{kind}}_mod
 
     ! Routine to return a deep copy of a field including all its data
     procedure, public :: copy_field_serial
+
+    !> Routine a container calls to have the field copy itself
+    procedure, public :: clone => field_clone
 
     ! Routine to return a deep, but empty copy of a field
     procedure, public :: copy_field_properties
@@ -258,15 +278,16 @@ contains
   !> @param [in] name The field name. 'none' (constant name_none) is a reserved name
   !> @param [in] override_data Optional alternative data that can be attached to field
   !> @param [in] halo_depth Optional alternative halo depth
-  !> @param [in] shared_data Optional request that the field's data be claimed
-  !!                         from Kokkos shared space, so that a generated
-  !!                         Kokkos region and this field see one address.
-  !!                         Ignored when override_data is given, since that
-  !!                         names storage the caller already has. The claimed
-  !!                         block is owned by kokkos_memory_mod and released
-  !!                         at shutdown, so this should be asked for only by a
-  !!                         caller whose fields are created a bounded number
-  !!                         of times.
+  !> @param [in] shared_data Optional override of whether the field's data is
+  !!                         claimed from Kokkos shared space, so that a
+  !!                         generated Kokkos region and this field see one
+  !!                         address. The default is what
+  !!                         kokkos_shared_fields_by_default says, which is
+  !!                         true in a Kokkos build, so this is normally an
+  !!                         opt-out rather than an opt-in. Ignored when
+  !!                         override_data is given, since that names storage
+  !!                         the caller already has. The claimed block is
+  !!                         given back by field_final.
   !>
   subroutine field_initialiser(self, &
                                vector_space, &
@@ -306,7 +327,12 @@ contains
 
     mesh => null()
 
-    claim_shared = .false.
+    ! Every field's data comes from shared space unless the caller says
+    ! otherwise. The answer is asked of kokkos_memory_mod rather than
+    ! decided here because this file is templated to lowercase .f90 and so
+    ! sees no preprocessor macros -- see that module's header. It is false in
+    ! a build without USE_KOKKOS, so a Fortran-only build is unaffected.
+    claim_shared = kokkos_shared_fields_by_default()
     if ( present(shared_data) ) claim_shared = shared_data
 
     if ( present(name) ) then
@@ -340,6 +366,7 @@ contains
 
     ! Associate data with the field
     self%data_is_shared = .false.
+    self%shared_token = 0_i_def
 
     if (present(override_data))then
       ! Override normal field data if an alternative was provided
@@ -347,15 +374,17 @@ contains
     else if (claim_shared) then
       ! Take the data from Kokkos shared space instead, so that one address is
       ! valid here and in a generated Kokkos region. It arrives through
-      ! override_data rather than through data, so that the field holds it by
-      ! a pointer it does not own: a field cannot own such a block, because
-      ! ALLOCATE with SOURCE= duplicates the field without duplicating the
-      ! block and without giving the type any way to notice, leaving two
-      ! objects that would each free it. kokkos_memory_mod owns it instead and
-      ! releases it at shutdown.
+      ! override_data rather than through data, because it is not an
+      ! allocatable: kokkos_memory_mod's registry is the authority on which
+      ! blocks are live, and this field gives this one back in field_final.
+      ! That is safe only because a field is never duplicated by ALLOCATE
+      ! with SOURCE= -- which would duplicate the pointer and not the block,
+      ! leaving two fields that would each release it. The clone below, and
+      ! copy_field_serial, are the only ways a field is copied.
       self%override_data => null()
       call kokkos_shared_claim( self%override_data,   &
-             vector_space%get_last_dof_halo(field_halo_depth) )
+             vector_space%get_last_dof_halo(field_halo_depth), &
+             token = self%shared_token )
       self%data_is_shared = .true.
 
       ! If run-time checking is on then initialise data with a signalling value
@@ -550,6 +579,45 @@ contains
 
   end subroutine field_type_assign
 
+  !> Make a copy of this field for a container to keep.
+  !>
+  !> @details linked_list_mod calls this instead of copying the payload with
+  !>          ALLOCATE(..., SOURCE=), which would copy override_data by
+  !>          copying the pointer and leave the list and the caller's local
+  !>          sharing one block -- which the local then released. The copy is
+  !>          made the only way a field may be copied, through initialise,
+  !>          and so claims a block of its own.
+  !>
+  !>          The list id is not part of what copy_field_serial copies, since
+  !>          it belongs to the object's place in a container rather than to
+  !>          the field, so it is carried over here.
+  !>
+  !> @param [in] self   The field to copy.
+  !> @param [out] copy  A newly allocated field holding the same values.
+  subroutine field_clone(self, copy)
+
+    implicit none
+
+    class(field_{{kind}}_type), intent(in)             :: self
+    class(linked_list_data_type), pointer, intent(out) :: copy
+
+    type(field_{{kind}}_type), pointer :: new_field => null()
+
+    allocate( new_field )
+
+    ! A field with no data yet has nothing for copy_field_serial to copy and
+    ! nothing held by pointer either, so it is left as it was allocated --
+    ! uninitialised, which is the state the one being copied is in.
+    if ( self%is_initialised() ) then
+      call self%copy_field_serial( new_field )
+    end if
+
+    call new_field%set_id( self%get_id() )
+
+    copy => new_field
+
+  end subroutine field_clone
+
   !> Destroy a scalar field_type instance.
   subroutine field_final(self)
 
@@ -557,7 +625,50 @@ contains
 
     class(field_{{kind}}_type), intent(inout) :: self
 
+    ! Whether the registry recognised the block. Read only to have somewhere
+    ! to put the answer: a field that claimed a block still owns it, so a
+    ! false here has already been counted and reported by the registry,
+    ! which is where the shutdown report reads it from.
+    logical(l_def) :: released
+
     call self%field_parent_final()
+
+    ! Give a claimed block back. Storage the application supplied through
+    ! override_data= is not this field's to release, and data_is_shared is
+    ! what tells the two apart. The token says which claim is being given
+    ! back, so that a release the registry cannot match is refused rather
+    ! than believed: this runs on whatever memory the finaliser is pointed
+    ! at, and that is not always still a field. Clearing both makes it
+    ! idempotent, which matters because field_array_mod's clear finalises
+    ! each member and then deallocates the bundle, finalising them again.
+    if ( self%data_is_shared ) then
+      ! The flag alone is not evidence that this is a field. A finaliser runs
+      ! on whatever memory it is pointed at, and the model finalises objects
+      ! holding a field by value in memory that was never initialised: there
+      ! the flag and the token are whatever was in that memory. The token is
+      ! the test, because the registry's serial numbers are never reused, so
+      ! one it never issued cannot have come from a claim. A copy of a live
+      ! field carries a token that was issued and is still refused below,
+      ! which is what the unknown-release count is for.
+      ! A claim of length zero registers nothing and is given no token, so
+      ! there is no entry to find and nothing to give back; the shared
+      ! allocator answers a zero-byte request with a null pointer.
+      if ( self%shared_token == 0_i_def ) then
+        released = .true._l_def
+      else if ( kokkos_shared_token_issued( self%shared_token ) ) then
+        released = kokkos_shared_release( self%override_data,                 &
+                                          token = self%shared_token )
+        ! A refusal is counted and reported by the registry, which knows the
+        ! pointer and not who held it. The name is what says which field was
+        ! copied, and so where to look; the backtrace behind
+        ! LFRIC_KOKKOS_LIFETIME_TRACE=<n> says by whom.
+        if ( .not. released ) call kokkos_shared_name_refusal( self%get_name() )
+      else
+        call kokkos_shared_note_stale_finalisation()
+      end if
+      self%data_is_shared = .false.
+      self%shared_token = 0_i_def
+    end if
 
     if(allocated(self%data)) then
       deallocate(self%data)
