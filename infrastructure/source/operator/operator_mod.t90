@@ -17,6 +17,12 @@ module operator_{{kind}}_mod
   use constants_mod,            only : i_def, l_def, &
                                        default_halo_depth
   use function_space_mod,       only : function_space_type
+  use kokkos_memory_mod,        only : kokkos_shared_claim, &
+                                       kokkos_shared_release, &
+                                       kokkos_shared_name_refusal, &
+                                       kokkos_shared_note_stale_finalisation, &
+                                       kokkos_shared_token_issued, &
+                                       kokkos_shared_fields_by_default
   use mesh_mod,                 only : mesh_type
   use log_mod,                  only : log_event, LOG_LEVEL_ERROR
   use operator_parent_mod,      only : operator_parent_type, &
@@ -31,7 +37,29 @@ module operator_{{kind}}_mod
    type, public, extends(operator_parent_type) :: operator_{{kind}}_type
     private
     !> Allocatable array of kind {{kind}} which holds the values of the operator
+    !! when they are held in ordinary memory
     real(kind={{kind}}), allocatable :: local_stencil( :, :, : )
+    !> The values of the operator when they come from Kokkos shared space,
+    !! seen with the shape the Psy layer and the kernels expect. It is a view
+    !! of shared_stencil and owns nothing itself.
+    real(kind={{kind}}), pointer :: override_stencil( :, :, : ) => null()
+    !> The claimed block itself, as the registry issued it. The registry deals
+    !! in rank-one arrays -- see kokkos_memory_mod's header -- so the claim is
+    !! made and given back through this, and override_stencil is remapped onto
+    !! it for everyone else to use.
+    real(kind={{kind}}), pointer :: shared_stencil( : ) => null()
+    !> Whether shared_stencil names a block claimed from Kokkos shared space,
+    !! and so whether this operator has one to give back. An operator may only
+    !! be copied through initialise, so no two operators ever have this set
+    !! for one block.
+    logical(l_def) :: stencil_is_shared = .false.
+    !> The serial number the registry issued this operator's block under, and
+    !! the second half of what operator_final presents to give it back. The
+    !! flag alone would be taken on trust, and a finaliser runs on whatever
+    !! memory it is pointed at, which is not always still an operator. The
+    !! registry never reuses a serial number, so one it never issued cannot
+    !! have come from a claim.
+    integer(i_def) :: shared_token = 0_i_def
     !> Size of the outermost dimemsion of the local_stencil array, equal to
     !! ncell*nlayers
     integer(i_def) :: ncell_3d
@@ -41,6 +69,10 @@ module operator_{{kind}}_mod
     !> Function to get a proxy with public pointers to the data in a
     !! operator_{{kind}}_type.
     procedure, public :: get_proxy => get_proxy_operator_{{kind}}
+    !> Copy this operator's values into another operator
+    procedure, public :: copy_operator_serial => operator_{{kind}}_copy_serial
+    !> Where this operator's values are, whichever way it holds them
+    procedure, private :: effective_stencil
     !> Deep copy methods
     procedure, private :: operator_{{kind}}_type_deep_copy
     procedure, public  :: deep_copy => operator_{{kind}}_type_deep_copy
@@ -73,8 +105,16 @@ contains
   !>
   !> @param [in] fs_from the function space that the operator maps from
   !> @param [in] fs_to the function space that the operator maps to
+  !> @param [in] shared_data Optional override of whether the operator's
+  !!                         stencil is claimed from Kokkos shared space, so
+  !!                         that a generated Kokkos region and this operator
+  !!                         see one address. The default is what
+  !!                         kokkos_shared_fields_by_default says, which is
+  !!                         true in a Kokkos build, so this is normally an
+  !!                         opt-out rather than an opt-in. The claimed block
+  !!                         is given back by operator_final.
   !>
-  subroutine operator_{{kind}}_initialiser( self, fs_to, fs_from )
+  subroutine operator_{{kind}}_initialiser( self, fs_to, fs_from, shared_data )
 
     use, intrinsic :: ieee_arithmetic, only: IEEE_INVALID
     use, intrinsic :: ieee_exceptions, only: ieee_set_halting_mode, ieee_get_halting_mode
@@ -83,15 +123,29 @@ contains
     class(operator_{{kind}}_type), target, intent(inout) :: self
     class(function_space_type),  target, intent(in)    :: fs_to
     class(function_space_type),  target, intent(in)    :: fs_from
+    logical(l_def), optional,            intent(in)    :: shared_data
 
     ! Defines whether to halt when invalid floating point numbers are experienced
     logical :: halt_mode
     ! The signalling number
     real({{kind}}) :: signalling_value
 
+    ! Whether this operator's stencil comes from Kokkos shared space
+    logical(l_def) :: claim_shared
+
+    integer(i_def) :: ndf_to, ndf_from
+
     type(mesh_type), pointer :: mesh
 
     nullify( mesh )
+
+    ! Every operator's stencil comes from shared space unless the caller says
+    ! otherwise. The answer is asked of kokkos_memory_mod rather than decided
+    ! here because this file is templated to lowercase .f90 and so sees no
+    ! preprocessor macros -- see that module's header. It is false in a build
+    ! without USE_KOKKOS, so a Fortran-only build is unaffected.
+    claim_shared = kokkos_shared_fields_by_default()
+    if ( present(shared_data) ) claim_shared = shared_data
 
     ! initialise the parent
     call self%operator_parent_initialiser( fs_to, fs_from )
@@ -99,24 +153,60 @@ contains
     mesh => fs_from%get_mesh()
     self%ncell_3d = mesh%get_last_halo_cell(default_halo_depth) * fs_from%get_nlayers()
     nullify(mesh)
-    ! allocate the array in memory
-    if(allocated(self%local_stencil))deallocate(self%local_stencil)
+
+    ndf_to   = fs_to%get_ndf()
+    ndf_from = fs_from%get_ndf()
+
+    ! In case the operator is already initialised, give back whatever storage
+    ! it holds ready for re-initialisation
+    call self%operator_final()
 
     ! If run-time checking for NaNs is on then initialise data with NaN
     call ieee_get_halting_mode(IEEE_INVALID, halt_mode)
 
-    if (halt_mode) then
+    if (claim_shared) then
+      ! Take the stencil from Kokkos shared space instead, so that one address
+      ! is valid here and in a generated Kokkos region. It arrives through a
+      ! pointer rather than through the allocatable, because the registry is
+      ! the authority on which blocks are live and this operator gives this
+      ! one back in operator_final. That is safe only because an operator is
+      ! never duplicated by ALLOCATE with SOURCE= -- which would duplicate the
+      ! pointer and not the block, leaving two operators that would each
+      ! release it. copy_operator_serial is the way an operator is copied.
+      call kokkos_shared_claim( self%shared_stencil,         &
+                                self%ncell_3d * ndf_to * ndf_from, &
+                                token = self%shared_token )
+      self%stencil_is_shared = .true.
+
+      ! The registry hands back a rank-one block; the Psy layer and the
+      ! kernels want the stencil with its three dimensions. Rank-remapping
+      ! pointer assignment gives that shape to the same addresses, so nothing
+      ! downstream can tell where the storage came from. A claim of length
+      ! zero is answered with a null pointer and there is nothing to remap.
+      if ( associated(self%shared_stencil) ) then
+        self%override_stencil(1:self%ncell_3d, 1:ndf_to, 1:ndf_from) => &
+                                                          self%shared_stencil
+        if (halt_mode) then
+          ! Temporarily turn off halting mode to safely set invalid value
+          call ieee_set_halting_mode(IEEE_INVALID, .false.)
+          signalling_value = get_signalling_value(signalling_value)
+          self%override_stencil(:,:,:) = signalling_value
+          call ieee_set_halting_mode(IEEE_INVALID, .true.)
+        end if
+      end if
+
+    else if (halt_mode) then
       ! Temporarily turn off halting mode to safely set invalid value
       call ieee_set_halting_mode(IEEE_INVALID, .false.)
 
       signalling_value = get_signalling_value(signalling_value)
-      allocate(self%local_stencil( self%ncell_3d, fs_to%get_ndf(), fs_from%get_ndf() ), &
+      allocate(self%local_stencil( self%ncell_3d, ndf_to, ndf_from ), &
                source=signalling_value)
 
       call ieee_set_halting_mode(IEEE_INVALID, .true.)
     else
       ! Normal operator allocation
-      allocate(self%local_stencil(self%ncell_3d, fs_to%get_ndf(), fs_from%get_ndf() ) )
+      allocate(self%local_stencil(self%ncell_3d, ndf_to, ndf_from ) )
     end if
 
   end subroutine operator_{{kind}}_initialiser
@@ -132,37 +222,153 @@ contains
     ! Call the routine that initialises the proxy for data held in the parent
     call self%operator_parent_proxy_initialiser(get_proxy_operator_{{kind}})
 
-    get_proxy_operator_{{kind}} % local_stencil  => self % local_stencil
+    ! The proxy is given the stencil wherever it is held. Its component is a
+    ! pointer either way, so the Psy layer and the kernels are unchanged by an
+    ! operator taking its storage from shared space.
+    if (allocated(self%local_stencil)) then
+      get_proxy_operator_{{kind}} % local_stencil  => self % local_stencil
+    else
+      get_proxy_operator_{{kind}} % local_stencil  => self % override_stencil
+    end if
     get_proxy_operator_{{kind}} % ncell_3d       =  self%ncell_3d
   end function get_proxy_operator_{{kind}}
 
+  !> Return a pointer to the operator's values, wherever they are held.
+  !>
+  !> @return stencil  The operator's values, or a disassociated pointer if the
+  !>                  operator has none.
+  function effective_stencil(self) result(stencil)
+
+    implicit none
+
+    class(operator_{{kind}}_type), target, intent(in) :: self
+    real(kind={{kind}}), pointer                      :: stencil( :, :, : )
+
+    if ( allocated(self%local_stencil) ) then
+      stencil => self%local_stencil
+    else
+      stencil => self%override_stencil
+    end if
+
+  end function effective_stencil
+
+  !> @brief Copy this operator's properties and values into another operator.
+  !>
+  !> @details This is the way an operator is copied. The copy takes its
+  !>          storage from wherever the source took its own, so that a copy of
+  !>          an operator in shared space is in shared space as well, and
+  !>          claims a block of its own rather than naming the source's.
+  !>
+  !> @param [in,out] dest  The operator to copy into
+  subroutine operator_{{kind}}_copy_serial(self, dest)
+
+    implicit none
+
+    class(operator_{{kind}}_type), target, intent(in)  :: self
+    type(operator_{{kind}}_type),  target, intent(out) :: dest
+
+    real(kind={{kind}}), pointer :: source_stencil( :, :, : )
+
+    type( function_space_type ), pointer :: fs_to => null( )
+    type( function_space_type ), pointer :: fs_from => null( )
+
+    source_stencil => self%effective_stencil()
+
+    if ( .not. associated(source_stencil) ) then
+      call log_event( 'Error: copy_operator_serial: copied operator must ' // &
+                      'have stencil values', LOG_LEVEL_ERROR )
+    end if
+
+    fs_to => self%get_fs_to()
+    fs_from => self%get_fs_from()
+
+    call dest%initialise( fs_to, fs_from, &
+                          shared_data = self%stencil_is_shared )
+
+    ! The same question is asked of the destination, but inline rather than
+    ! through effective_stencil. That function's argument is intent(in), and a
+    ! pointer obtained from an intent(in) target must not be used to write to
+    ! it, so it can find the source's values but not fill the copy's.
+    if ( allocated(dest%local_stencil) ) then
+      dest%local_stencil(:,:,:) = source_stencil(:,:,:)
+    else
+      dest%override_stencil(:,:,:) = source_stencil(:,:,:)
+    end if
+
+  end subroutine operator_{{kind}}_copy_serial
+
   !> @brief Copies the current operator into a new returned object
+  !>
+  !> @details The copy is made in ordinary memory whatever the original holds.
+  !>          A function result is finalised after the assignment that
+  !>          consumes it, and an intrinsic assignment of an operator copies a
+  !>          pointer component by copying the pointer: were the result to hold
+  !>          a claimed block, the operator assigned to would be left naming a
+  !>          block the result had just given back. Callers that need the copy
+  !>          in shared space -- so that a generated Kokkos region sees it --
+  !>          use copy_operator_serial, which copies into a destination that
+  !>          outlives the call.
+  !>
   !> @return The copies operator type
   function operator_{{kind}}_type_deep_copy(self) result(other)
     implicit none
-    class(operator_{{kind}}_type), intent(in) :: self
+    class(operator_{{kind}}_type), target, intent(in) :: self
     type(operator_{{kind}}_type) :: other
+    real(kind={{kind}}), pointer :: source_stencil( :, :, : )
     ! make field_vector
     type( function_space_type ), pointer :: fs_to => null( )
     type( function_space_type ), pointer :: fs_from => null( )
     fs_to => self%get_fs_to()
     fs_from => self%get_fs_from()
 
-    call other%initialise( fs_to, fs_from )
-    other%local_stencil(:,:,:) = self%local_stencil(:,:,:)
+    source_stencil => self%effective_stencil()
+
+    call other%initialise( fs_to, fs_from, shared_data = .false._l_def )
+    other%local_stencil(:,:,:) = source_stencil(:,:,:)
   end function operator_{{kind}}_type_deep_copy
 
   !>@brief Destroys the operator type
-  pure subroutine operator_final(self)
+  subroutine operator_final(self)
     implicit none
     class(operator_{{kind}}_type), intent(inout) :: self
+
+    ! Whether the registry recognised the block. Read only to have somewhere
+    ! to put the answer: an operator that claimed a block still owns it, so a
+    ! false here has already been counted and reported by the registry.
+    logical(l_def) :: released
+
+    ! Give a claimed block back. The token says which claim is being given
+    ! back, so that a release the registry cannot match is refused rather than
+    ! believed: this runs on whatever memory the finaliser is pointed at, and
+    ! that is not always still an operator. Clearing both makes it idempotent.
+    if ( self%stencil_is_shared ) then
+      ! A claim of length zero registers nothing and is given no token, so
+      ! there is no entry to find and nothing to give back.
+      if ( self%shared_token == 0_i_def ) then
+        released = .true._l_def
+      else if ( kokkos_shared_token_issued( self%shared_token ) ) then
+        released = kokkos_shared_release( self%shared_stencil,  &
+                                          token = self%shared_token )
+        ! A refusal is counted and reported by the registry, which knows the
+        ! pointer and not who held it.
+        if ( .not. released ) call kokkos_shared_name_refusal( 'an operator' )
+      else
+        call kokkos_shared_note_stale_finalisation()
+      end if
+      self%stencil_is_shared = .false.
+      self%shared_token = 0_i_def
+    end if
+
+    nullify( self%shared_stencil )
+    nullify( self%override_stencil )
+
     if(allocated(self%local_stencil)) then
        deallocate(self%local_stencil)
     end if
   end subroutine operator_final
 
   !>@brief Finalizer for the object type
-  elemental subroutine operator_{{kind}}_destructor(self)
+  impure elemental subroutine operator_{{kind}}_destructor(self)
     implicit none
     type(operator_{{kind}}_type), intent(inout) :: self
     call self%destroy_operator_parent()

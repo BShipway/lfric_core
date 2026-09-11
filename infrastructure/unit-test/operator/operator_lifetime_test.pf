@@ -1,0 +1,265 @@
+!-----------------------------------------------------------------------------
+! (C) Crown copyright 2026 Met Office. All rights reserved.
+! The file LICENCE, distributed with this code, contains details of the terms
+! under which the code may be used.
+!-----------------------------------------------------------------------------
+
+!> @brief Where an operator's stencil comes from, and who gives it back.
+!>
+!> @details An operator takes its stencil from Kokkos shared space so that a
+!>          generated Kokkos region and the Fortran model see one address.
+!>          The block belongs to the operator that claimed it and is given
+!>          back when that operator is finalised. These cases measure both
+!>          halves against the registry's own count, and measure that a copy
+!>          claims a block of its own rather than naming the original's --
+!>          which is what an inventory pair's clone rests on.
+!>
+module operator_lifetime_test
+
+  use constants_mod,                 only : i_def, l_def
+  use function_space_collection_mod, only : function_space_collection_type, &
+                                            function_space_collection
+  use kokkos_memory_mod,             only : kokkos_shared_live_blocks, &
+                                            kokkos_shared_unknown_releases
+  use lfric_mpi_mod,                 only : global_mpi, &
+                                            lfric_comm_type
+  use local_mesh_mod,                only : local_mesh_type
+  use mesh_collection_mod,           only : mesh_collection_type, &
+                                            mesh_collection
+  use mesh_mod,                      only : mesh_type
+
+  use pfunit
+
+  implicit none
+
+  private
+  public :: set_up, tear_down
+  public :: test_a_shared_operator_claims_and_releases
+  public :: test_a_copy_claims_a_block_of_its_own
+  public :: test_an_unshared_operator_is_not_registered
+  !
+  ! pFUnit requires symbol spillage
+  !
+  public :: MPITestMethod, MPITestParameter
+
+  integer(i_def), parameter :: element_order_h = 0
+  integer(i_def), parameter :: element_order_v = 0
+
+contains
+
+  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+  @before
+  subroutine set_up( this )
+
+    implicit none
+
+    class(MPITestMethod), intent(inout) :: this
+    type(lfric_comm_type) :: lfric_comm
+
+    call lfric_comm%set_comm_mpi_val(this%getMpiCommunicator())
+
+    call global_mpi%initialise(lfric_comm)
+
+    mesh_collection = mesh_collection_type()
+    function_space_collection = function_space_collection_type()
+
+  end subroutine set_up
+
+  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+  @after
+  subroutine tear_down( this )
+
+    implicit none
+
+    class(MPITestMethod), intent(inout) :: this
+
+    call function_space_collection%clear()
+    call mesh_collection%clear()
+
+    call global_mpi%finalise()
+
+  end subroutine tear_down
+
+  !> Build the two function spaces every case here maps between.
+  subroutine spaces( local_mesh, unit_test_mesh, fs_to, fs_from )
+
+    use fs_continuity_mod,  only: W1, W2
+    use function_space_mod, only: function_space_type
+    use mesh_mod,           only: PLANE_BI_PERIODIC
+
+    implicit none
+
+    type(local_mesh_type), target, intent(inout) :: local_mesh
+    type(mesh_type),               intent(inout) :: unit_test_mesh
+    type(function_space_type), pointer, intent(out) :: fs_to
+    type(function_space_type), pointer, intent(out) :: fs_from
+
+    type(local_mesh_type), pointer :: local_mesh_ptr
+    type(mesh_type), pointer :: mesh => null()
+    integer(i_def) :: mesh_id
+
+    call local_mesh%initialise()
+    local_mesh_ptr => local_mesh
+
+    unit_test_mesh = mesh_type( PLANE_BI_PERIODIC, local_mesh_ptr )
+    mesh_id = mesh_collection%add_new_mesh( unit_test_mesh )
+    mesh => mesh_collection%get_mesh( mesh_id )
+
+    fs_from => function_space_collection%get_fs( mesh, element_order_h, &
+                                                 element_order_v, W1 )
+    fs_to   => function_space_collection%get_fs( mesh, element_order_h, &
+                                                 element_order_v, W2 )
+
+  end subroutine spaces
+
+  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+  !> @brief An operator given shared space claims one block and gives it back.
+  !> @details Counted before and after rather than against zero, because the
+  !>          registry is process-wide and other cases share it. The proxy is
+  !>          asked for the stencil in between: the Psy layer must not be able
+  !>          to tell that the storage came from the registry.
+  @Test( npes=[1] )
+  subroutine test_a_shared_operator_claims_and_releases( this )
+
+    use operator_mod,       only: operator_type, operator_proxy_type
+    use function_space_mod, only: function_space_type
+
+    implicit none
+
+    class(MPITestMethod), intent(inout) :: this
+
+    type(local_mesh_type), target :: local_mesh
+    type(mesh_type) :: unit_test_mesh
+    type(function_space_type), pointer :: fs_to => null()
+    type(function_space_type), pointer :: fs_from => null()
+
+    type(operator_type) :: op
+    type(operator_proxy_type) :: op_p
+
+    integer(i_def) :: before_live, before_unknown, stencil_size
+
+    call spaces( local_mesh, unit_test_mesh, fs_to, fs_from )
+
+    before_live = kokkos_shared_live_blocks()
+    before_unknown = kokkos_shared_unknown_releases()
+
+    call op%initialise( fs_to, fs_from, shared_data = .true._l_def )
+
+    @assertEqual( before_live + 1_i_def, kokkos_shared_live_blocks() )
+
+    op_p = op%get_proxy()
+    @assertTrue( associated( op_p%local_stencil ) )
+    stencil_size = op_p%ncell_3d * fs_to%get_ndf() * fs_from%get_ndf()
+    @assertEqual( stencil_size, size( op_p%local_stencil ) )
+
+    ! The block is writable through the shape the kernels are given
+    op_p%local_stencil(:,:,:) = 3.0
+    @assertEqual( 3.0, op_p%local_stencil(1,1,1) )
+
+    call op%operator_final()
+
+    @assertEqual( before_live, kokkos_shared_live_blocks() )
+    @assertEqual( before_unknown, kokkos_shared_unknown_releases() )
+
+  end subroutine test_a_shared_operator_claims_and_releases
+
+  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+  !> @brief A copy claims a block of its own and keeps the values.
+  !> @details This is what an inventory pair's clone rests on. Were the copy
+  !>          to name the original's block -- which an intrinsic copy of a
+  !>          pointer component does -- the live count would not rise, and the
+  !>          second release would be refused and counted.
+  @Test( npes=[1] )
+  subroutine test_a_copy_claims_a_block_of_its_own( this )
+
+    use operator_mod,       only: operator_type, operator_proxy_type
+    use function_space_mod, only: function_space_type
+
+    implicit none
+
+    class(MPITestMethod), intent(inout) :: this
+
+    type(local_mesh_type), target :: local_mesh
+    type(mesh_type) :: unit_test_mesh
+    type(function_space_type), pointer :: fs_to => null()
+    type(function_space_type), pointer :: fs_from => null()
+
+    type(operator_type) :: op, copy
+    type(operator_proxy_type) :: op_p, copy_p
+
+    integer(i_def) :: before_live, before_unknown
+
+    call spaces( local_mesh, unit_test_mesh, fs_to, fs_from )
+
+    before_live = kokkos_shared_live_blocks()
+    before_unknown = kokkos_shared_unknown_releases()
+
+    call op%initialise( fs_to, fs_from, shared_data = .true._l_def )
+    op_p = op%get_proxy()
+    op_p%local_stencil(:,:,:) = 7.0
+
+    call op%copy_operator_serial( copy )
+
+    @assertEqual( before_live + 2_i_def, kokkos_shared_live_blocks() )
+
+    copy_p = copy%get_proxy()
+    @assertEqual( 7.0, copy_p%local_stencil(1,1,1) )
+    @assertFalse( associated( copy_p%local_stencil, op_p%local_stencil ) )
+
+    ! The original goes first: the copy must still hold its own values after
+    call op%operator_final()
+    @assertEqual( 7.0, copy_p%local_stencil(1,1,1) )
+
+    call copy%operator_final()
+
+    @assertEqual( before_live, kokkos_shared_live_blocks() )
+    @assertEqual( before_unknown, kokkos_shared_unknown_releases() )
+
+  end subroutine test_a_copy_claims_a_block_of_its_own
+
+  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+  !> @brief An operator that opts out registers nothing and still works.
+  !> @details This is the Fortran-only build's path, which the default takes
+  !>          when kokkos_memory_mod says fields are not shared.
+  @Test( npes=[1] )
+  subroutine test_an_unshared_operator_is_not_registered( this )
+
+    use operator_mod,       only: operator_type, operator_proxy_type
+    use function_space_mod, only: function_space_type
+
+    implicit none
+
+    class(MPITestMethod), intent(inout) :: this
+
+    type(local_mesh_type), target :: local_mesh
+    type(mesh_type) :: unit_test_mesh
+    type(function_space_type), pointer :: fs_to => null()
+    type(function_space_type), pointer :: fs_from => null()
+
+    type(operator_type) :: op
+    type(operator_proxy_type) :: op_p
+
+    integer(i_def) :: before_live, before_unknown
+
+    call spaces( local_mesh, unit_test_mesh, fs_to, fs_from )
+
+    before_live = kokkos_shared_live_blocks()
+    before_unknown = kokkos_shared_unknown_releases()
+
+    call op%initialise( fs_to, fs_from, shared_data = .false._l_def )
+
+    @assertEqual( before_live, kokkos_shared_live_blocks() )
+
+    op_p = op%get_proxy()
+    @assertTrue( associated( op_p%local_stencil ) )
+    op_p%local_stencil(:,:,:) = 1.0
+    @assertEqual( 1.0, op_p%local_stencil(1,1,1) )
+
+    call op%operator_final()
+
+    @assertEqual( before_live, kokkos_shared_live_blocks() )
+    @assertEqual( before_unknown, kokkos_shared_unknown_releases() )
+
+  end subroutine test_an_unshared_operator_is_not_registered
+
+end module operator_lifetime_test
