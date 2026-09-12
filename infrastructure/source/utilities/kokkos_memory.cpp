@@ -30,7 +30,13 @@
 
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <unordered_map>
+
+#if defined(KOKKOS_ENABLE_CUDA)
+#include <cuda_runtime.h>
+#endif
 
 // Kokkos_Core_fwd.hpp defines has_shared_space true in every configuration that
 // resolves the SharedSpace alias, and leaves it false for OpenACC and
@@ -66,6 +72,116 @@ std::size_t live_blocks = 0;
 // scans for those.
 std::unordered_map<void *, std::size_t> issued;
 
+// MEMORY ADVICE: where a shared-space block should live, and who else may
+// touch it. A SharedSpace block on a CUDA build is managed (UVM) memory whose
+// pages migrate to whichever processor touches them, one fault at a time.
+// Phase 7's first measurement on an H100 (2026-09-12, C16_MG, four
+// timesteps) saw 2.6 GB migrate each way against a 240 MB field set, with
+// 170 thousand GPU page faults, and the device model stepping slower than
+// one Fortran core. The advice is the cheapest lever the strategy names
+// (docs/strategy/2026-09-03-device-memory.md; phase-7 plan, Task B3):
+//
+//   LFRIC_KOKKOS_MEM_ADVICE=none    the runtime's default; every page migrates
+//                                   on touch. What every run before this knob
+//                                   did.
+//   LFRIC_KOKKOS_MEM_ADVICE=device  prefer the device: pages are prefetched to
+//                                   the card at allocation and stay there, and
+//                                   the CPU is declared an accessor, so a host
+//                                   read of a field maps the page across the
+//                                   bus instead of migrating it back.
+//   LFRIC_KOKKOS_MEM_ADVICE=host    the mirror image: pages stay on the host
+//                                   and the device is the accessor. The
+//                                   control that says whether "advice at all"
+//                                   or "the device end" is what moves a figure.
+//
+// Read once, on the first allocation, and reported on the shared report
+// line. Anything but the three names is refused to `none` with a message,
+// not silently. On a host-only build the advice compiles to nothing: the
+// alias is HostSpace and there is no other processor to prefer. The CUDA
+// 13 signatures take a cudaMemLocation; the older int-device forms are
+// gone from that toolkit, which is why the struct is built here.
+enum class Advice { none, device, host };
+
+Advice advice_mode()
+{
+  static const Advice mode = [] {
+    const char *value = std::getenv("LFRIC_KOKKOS_MEM_ADVICE");
+    if (value == nullptr || *value == '\0' || std::strcmp(value, "none") == 0) {
+      return Advice::none;
+    }
+    if (std::strcmp(value, "device") == 0) {
+      return Advice::device;
+    }
+    if (std::strcmp(value, "host") == 0) {
+      return Advice::host;
+    }
+    std::fprintf(stderr,
+                 "lfric_kokkos_shared: LFRIC_KOKKOS_MEM_ADVICE=%s is not none, "
+                 "device or host; using none\n", value);
+    return Advice::none;
+  }();
+  return mode;
+}
+
+const char *advice_name()
+{
+  switch (advice_mode()) {
+    case Advice::device: return "device";
+    case Advice::host: return "host";
+    default: return "none";
+  }
+}
+
+// Counted so the report line can say how many blocks were advised and how
+// many of those advice calls the runtime refused, which on a card without
+// the feature (or a host-only build) is every one of them or none.
+std::size_t advised_blocks = 0;
+std::size_t advice_failures = 0;
+
+void advise(void *pointer, std::size_t nbytes)
+{
+#if defined(KOKKOS_ENABLE_CUDA)
+  const Advice mode = advice_mode();
+  if (mode == Advice::none || pointer == nullptr || nbytes == 0) {
+    return;
+  }
+  int device = 0;
+  if (cudaGetDevice(&device) != cudaSuccess) {
+    advice_failures += 1;
+    return;
+  }
+  cudaMemLocation on_device{};
+  on_device.type = cudaMemLocationTypeDevice;
+  on_device.id = device;
+  cudaMemLocation on_host{};
+  on_host.type = cudaMemLocationTypeHost;
+  on_host.id = 0;
+  const cudaMemLocation &preferred = (mode == Advice::device) ? on_device : on_host;
+  const cudaMemLocation &accessor = (mode == Advice::device) ? on_host : on_device;
+  bool ok = true;
+  ok = ok && cudaMemAdvise(pointer, nbytes, cudaMemAdviseSetPreferredLocation,
+                           preferred) == cudaSuccess;
+  ok = ok && cudaMemAdvise(pointer, nbytes, cudaMemAdviseSetAccessedBy,
+                           accessor) == cudaSuccess;
+  if (ok && mode == Advice::device) {
+    // Start the pages where they are wanted rather than faulting them over
+    // one at a time on the first region entry. Asynchronous on the default
+    // stream; the first region's fence orders it.
+    ok = cudaMemPrefetchAsync(pointer, nbytes, on_device, 0, nullptr) == cudaSuccess;
+  }
+  if (ok) {
+    advised_blocks += 1;
+  } else {
+    advice_failures += 1;
+    // Clear a sticky error so the next CUDA call is not blamed for this one.
+    (void)cudaGetLastError();
+  }
+#else
+  (void)pointer;
+  (void)nbytes;
+#endif
+}
+
 }  // namespace
 
 // Returns nullptr rather than aborting when the runtime is not up, so that a
@@ -83,6 +199,7 @@ extern "C" void *lfric_kokkos_shared_allocate(std::size_t nbytes)
 
   void *pointer = Kokkos::kokkos_malloc<Kokkos::SharedSpace>(nbytes);
   if (pointer != nullptr) {
+    advise(pointer, nbytes);
     issued[pointer] = 0;
     live_bytes += nbytes;
     live_blocks += 1;
@@ -160,14 +277,16 @@ extern "C" std::size_t lfric_kokkos_shared_peak_bytes()
 
 // One line, to stderr. Not through log_mod: gungho_model finalises the logger
 // before it finalises Kokkos, so no logger exists by the time this is called.
-// The format is matched by psy-ir-aidev's tests/test_field_data_is_shared.sh,
-// so changing it breaks that gate.
+// The prefix through "blocks" is matched by psy-ir-aidev's
+// tests/test_field_data_is_shared.sh and read by bin/measure-timestep, so it
+// is kept exactly; the advice fields are appended after it.
 extern "C" void lfric_kokkos_shared_report()
 {
   std::fprintf(stderr,
                "lfric_kokkos_shared: peak %zu bytes, "
-               "%zu bytes live in %zu blocks\n",
-               peak_bytes, live_bytes, live_blocks);
+               "%zu bytes live in %zu blocks, advice=%s advised=%zu refused=%zu\n",
+               peak_bytes, live_bytes, live_blocks,
+               advice_name(), advised_blocks, advice_failures);
 }
 
 #endif
