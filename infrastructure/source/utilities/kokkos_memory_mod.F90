@@ -52,6 +52,17 @@
 !>          and kokkos_shared_unknown_releases reports how many releases named
 !>          a block nothing here had issued.
 !>
+!>          A released block need not go back to the driver. With
+!>          LFRIC_KOKKOS_SHARED_POOL=1 the C++ half keeps it, keyed by its
+!>          exact byte count, and hands it to the next request of that size;
+!>          on a CUDA build that removes a cudaMallocManaged and a cudaFree,
+!>          and the two whole-device fences Kokkos puts either side of each.
+!>          The knob is off by default. It changes nothing this module can
+!>          see: a pooled block is not live, so the byte and block counts
+!>          here read exactly as they do without it, and only
+!>          kokkos_shared_pool_reuses and kokkos_shared_pool_held_bytes say
+!>          it fired.
+!>
 module kokkos_memory_mod
 
   ! real32, real64 and int32 are the kinds field_mod.t90 is instantiated for.
@@ -83,6 +94,9 @@ module kokkos_memory_mod
             kokkos_shared_default_for_setting, &
             kokkos_shared_bytes,              &
             kokkos_shared_peak_bytes,         &
+            kokkos_shared_pool_enabled,       &
+            kokkos_shared_pool_reuses,        &
+            kokkos_shared_pool_held_bytes,    &
             kokkos_shared_report,             &
             kokkos_shared_report_lifetime,    &
             kokkos_shared_name_refusal,       &
@@ -269,6 +283,36 @@ module kokkos_memory_mod
     subroutine lfric_kokkos_shared_report()                                  &
                bind(c, name='lfric_kokkos_shared_report')
     end subroutine lfric_kokkos_shared_report
+
+    !> @brief Asks whether the free list of released blocks is switched on.
+    !> @return enabled   One when LFRIC_KOKKOS_SHARED_POOL is 1, zero
+    !>                   otherwise. The C++ side reads the environment once.
+    function lfric_kokkos_shared_pool_enabled()                              &
+             bind(c, name='lfric_kokkos_shared_pool_enabled') result(enabled)
+      import :: c_int
+      implicit none
+      integer(c_int) :: enabled
+    end function lfric_kokkos_shared_pool_enabled
+
+    !> @brief Asks how many requests the free list has served.
+    !> @return reuses   Allocations handed a released block instead of one
+    !>                  taken from the driver.
+    function lfric_kokkos_shared_pool_reuses()                               &
+             bind(c, name='lfric_kokkos_shared_pool_reuses') result(reuses)
+      import :: c_size_t
+      implicit none
+      integer(c_size_t) :: reuses
+    end function lfric_kokkos_shared_pool_reuses
+
+    !> @brief Asks how many bytes the free list is holding unused.
+    !> @return bytes   Bytes released and kept, which are allocated on the
+    !>                 card and belong to no field.
+    function lfric_kokkos_shared_pool_held_bytes()                           &
+             bind(c, name='lfric_kokkos_shared_pool_held_bytes') result(bytes)
+      import :: c_size_t
+      implicit none
+      integer(c_size_t) :: bytes
+    end function lfric_kokkos_shared_pool_held_bytes
 
   end interface
 #endif
@@ -1437,6 +1481,66 @@ contains
 #endif
 
   end function kokkos_shared_peak_bytes
+
+  !> @brief Reports whether released blocks are kept for re-issue.
+  !> @details The free list lives in the C++ half, because that is where the
+  !>          driver calls it removes are made. This is the Fortran face of
+  !>          its knob, and it answers the announce rule's question in a form
+  !>          a caller can branch on rather than by parsing the report line.
+  !>          Without USE_KOKKOS there is no allocator to pool for, so the
+  !>          answer is false however the environment is set.
+  !> @return enabled   Whether LFRIC_KOKKOS_SHARED_POOL resolved to on.
+  function kokkos_shared_pool_enabled() result(enabled)
+
+    implicit none
+
+    logical(l_def) :: enabled
+
+#ifdef USE_KOKKOS
+    enabled = ( lfric_kokkos_shared_pool_enabled() /= 0_c_int )
+#else
+    enabled = .false._l_def
+#endif
+
+  end function kokkos_shared_pool_enabled
+
+  !> @brief Reports how many allocations were served from the free list.
+  !> @details Zero with the pool off and zero without USE_KOKKOS, so a
+  !>          non-zero figure is by itself the statement that the knob fired
+  !>          and found something to hand on.
+  !> @return reuses   Allocations that took a released block.
+  function kokkos_shared_pool_reuses() result(reuses)
+
+    implicit none
+
+    integer(i_long) :: reuses
+
+#ifdef USE_KOKKOS
+    reuses = int( lfric_kokkos_shared_pool_reuses(), i_long )
+#else
+    reuses = 0_i_long
+#endif
+
+  end function kokkos_shared_pool_reuses
+
+  !> @brief Reports the bytes the free list is holding unused.
+  !> @details These bytes are allocated on the device and owned by no field,
+  !>          so they are not counted by kokkos_shared_bytes and are the
+  !>          difference between what the run holds and what it is using.
+  !> @return bytes   Bytes released and kept; zero without USE_KOKKOS.
+  function kokkos_shared_pool_held_bytes() result(bytes)
+
+    implicit none
+
+    integer(i_long) :: bytes
+
+#ifdef USE_KOKKOS
+    bytes = int( lfric_kokkos_shared_pool_held_bytes(), i_long )
+#else
+    bytes = 0_i_long
+#endif
+
+  end function kokkos_shared_pool_held_bytes
 
   !> @brief Writes a shared-space summary to standard error.
   !> @details Called on the way out, from driver_kokkos_mod's finalise. It
