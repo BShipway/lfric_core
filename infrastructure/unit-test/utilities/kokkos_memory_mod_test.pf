@@ -33,6 +33,9 @@ module kokkos_memory_mod_test
                                 kokkos_shared_unknown_releases, &
                                 kokkos_shared_fields_by_default, &
                                 kokkos_shared_default_for_setting, &
+                                kokkos_shared_pool_enabled, &
+                                kokkos_shared_pool_reuses, &
+                                kokkos_shared_pool_held_bytes, &
                                 kokkos_shared_token_issued
 
   use funit
@@ -184,6 +187,50 @@ contains
     @assertEqual(0_i_long, kokkos_shared_bytes())
 
   end subroutine test_accounting_is_absent_without_kokkos
+
+  !> Test that the free list is absent in a build without USE_KOKKOS.
+  !>
+  !> @details The free list lives in the C++ half, so a Fortran-only build has
+  !>          nothing to pool: kokkos_shared_allocate is a plain ALLOCATE and
+  !>          kokkos_shared_free a plain DEALLOCATE, and the storage goes back
+  !>          to the Fortran runtime whatever LFRIC_KOKKOS_SHARED_POOL says.
+  !>          The three accessors must therefore answer "off, none, nothing"
+  !>          here -- which is the same statement, for the pool, that
+  !>          test_accounting_is_absent_without_kokkos makes for the byte
+  !>          counters, and it is made after a full allocate/free/allocate
+  !>          cycle rather than on a cold module, because a cold module would
+  !>          answer zero even if the pool were wired up wrongly.
+  !>
+  !>          The Kokkos branch cannot be reached from here and this case does
+  !>          not pretend to cover it; psy-ir-aidev's
+  !>          tests/test_kokkos_shared_memory.sh builds the same two source
+  !>          files with USE_KOKKOS and asserts the reuse, the held bytes and
+  !>          the report line's pool= field.
+  !>
+  @test
+  subroutine test_the_free_list_is_absent_without_kokkos( )
+
+    implicit none
+
+    real(real64), pointer :: array( : ) => null()
+
+    call kokkos_shared_allocate( array, 128_i_def )
+    call kokkos_shared_free( array )
+    call kokkos_shared_allocate( array, 128_i_def )
+
+    @assertTrue(associated(array))
+    @assertEqual(128_i_def, int(size(array), i_def))
+
+    @assertFalse(kokkos_shared_pool_enabled())
+    @assertEqual(0_i_long, kokkos_shared_pool_reuses())
+    @assertEqual(0_i_long, kokkos_shared_pool_held_bytes())
+
+    call kokkos_shared_free( array )
+
+    @assertFalse(associated(array))
+    @assertEqual(0_i_long, kokkos_shared_pool_held_bytes())
+
+  end subroutine test_the_free_list_is_absent_without_kokkos
 
   !> Test that releasing a claimed block gives it back to the registry.
   !>
