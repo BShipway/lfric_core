@@ -436,6 +436,22 @@ extern "C" std::size_t lfric_kokkos_shared_index(void *pointer)
   return found->second;
 }
 
+// Returns 1 if this allocator issued the pointer and has not yet reclaimed it,
+// and 0 otherwise. The index query above cannot answer this: it returns zero
+// both for a pointer the allocator never issued and for one it issued without
+// a registry entry owning it -- the state of every block that came from
+// kokkos_shared_allocate rather than kokkos_shared_claim -- and a caller that
+// needs to know whether an address is shared-space memory has to tell those
+// apart. kokkos_reduce_mod is such a caller: a reduction may only be launched
+// over a pointer a device View can be taken of.
+extern "C" int lfric_kokkos_shared_owns(void *pointer)
+{
+  if (pointer == nullptr) {
+    return 0;
+  }
+  return issued.find(pointer) != issued.end() ? 1 : 0;
+}
+
 // Records the one-based registry index owning a pointer, doing nothing if this
 // allocator did not issue it. Called when a block is claimed, and again when a
 // release moves the registry's last entry into the hole the released block

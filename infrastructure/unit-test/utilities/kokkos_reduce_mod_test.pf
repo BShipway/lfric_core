@@ -1,0 +1,370 @@
+!-----------------------------------------------------------------------------
+! (C) Crown copyright 2026 Met Office. All rights reserved.
+! The file LICENCE, distributed with this code, contains details of the terms
+! under which the code may be used.
+!-----------------------------------------------------------------------------
+
+!> @brief Tests the device reductions' Fortran face.
+!>
+!> @details The unit-test suite is built without USE_KOKKOS -- that macro is
+!>          set only by lfric_apps/applications/gungho_model/Makefile -- so in
+!>          the object these cases link against kokkos_reduce_mod can never
+!>          serve a request: kokkos_reduce_enabled() is false whatever the
+!>          environment says, and every routine returns .false. for the caller
+!>          to run its own loop. That is exactly the property a Fortran-only
+!>          build needs, and it is what the refusal cases below assert.
+!>
+!>          The numeric cases are written so that they are cover wherever the
+!>          module can serve: each computes the Fortran loop's answer in the
+!>          same order and precision the loop uses, and then asserts either
+!>          that the module declined, or that it returned that answer bit for
+!>          bit. Built without Kokkos they take the first arm; built with it
+!>          on a host at one thread they take the second. The build that
+!>          actually exercises the second arm today is psy-ir-aidev's
+!>          tests/test_kokkos_reduce.sh, which compiles these same two source
+!>          files with and without USE_KOKKOS inside the container and
+!>          compares the two answers bit for bit.
+!>
+module kokkos_reduce_mod_test
+
+  use, intrinsic :: iso_fortran_env, only : real32, real64
+
+  use constants_mod,     only : i_def, i_long, l_def
+  use kokkos_memory_mod, only : kokkos_shared_owns
+  use kokkos_reduce_mod, only : kokkos_reduce_enabled,        &
+                                kokkos_reduce_innerproduct_x, &
+                                kokkos_reduce_innerproduct_y, &
+                                kokkos_reduce_min_max,        &
+                                kokkos_reduce_calls,          &
+                                kokkos_reduce_fallbacks
+
+  use funit
+
+  implicit none
+
+  !> Long enough that a partial reduction is not the whole array, short enough
+  !> to stay exact in both real kinds.
+  integer(i_def), parameter :: length = 256_i_def
+
+contains
+
+  !> Test that the knob cannot come on in a build without Kokkos.
+  !>
+  !> @details This is the case that says which build the suite is. If
+  !>          USE_KOKKOS were ever defined for the unit tests this assertion
+  !>          would fail whenever LFRIC_KOKKOS_LITE_REDUCE was set, which is
+  !>          the intended signal: the refusal cases below would then be
+  !>          testing a path they do not claim to cover.
+  !>
+  @test
+  subroutine test_reductions_are_absent_without_kokkos( )
+
+    implicit none
+
+    @assertFalse(kokkos_reduce_enabled())
+    @assertEqual(0_i_long, kokkos_reduce_calls())
+
+  end subroutine test_reductions_are_absent_without_kokkos
+
+  !> Test that the squared-norm reduction agrees with the loop it replaces,
+  !> on a 32-bit real field.
+  !>
+  @test
+  subroutine test_innerproduct_x_real32_matches_the_loop( )
+
+    implicit none
+
+    real(real32), pointer :: field( : ) => null()
+    real(real64)          :: reference, answer
+    integer(i_def)        :: df
+    logical(l_def)        :: handled
+
+    allocate( field(length) )
+    do df = 1, length
+      field(df) = real(df, real32) * 0.5_real32
+    end do
+
+    reference = 0.0_real64
+    do df = 1, length
+      reference = reference + real(field(df), real64)**2
+    end do
+
+    handled = kokkos_reduce_innerproduct_x( field, length, answer )
+
+    if ( handled ) then
+      @assertEqual(reference, answer)
+    else
+      @assertFalse(kokkos_reduce_enabled())
+    end if
+
+    deallocate( field )
+
+  end subroutine test_innerproduct_x_real32_matches_the_loop
+
+  !> Test that the squared-norm reduction agrees with the loop it replaces,
+  !> on a 64-bit real field, which is what an r_solver of real64 presents.
+  !>
+  @test
+  subroutine test_innerproduct_x_real64_matches_the_loop( )
+
+    implicit none
+
+    real(real64), pointer :: field( : ) => null()
+    real(real64)          :: reference, answer
+    integer(i_def)        :: df
+    logical(l_def)        :: handled
+
+    allocate( field(length) )
+    do df = 1, length
+      field(df) = real(df, real64) * 0.25_real64
+    end do
+
+    reference = 0.0_real64
+    do df = 1, length
+      reference = reference + field(df)**2
+    end do
+
+    handled = kokkos_reduce_innerproduct_x( field, length, answer )
+
+    if ( handled ) then
+      @assertEqual(reference, answer)
+    else
+      @assertFalse(kokkos_reduce_enabled())
+    end if
+
+    deallocate( field )
+
+  end subroutine test_innerproduct_x_real64_matches_the_loop
+
+  !> Test that the two-field inner product agrees with the loop it replaces.
+  !>
+  @test
+  subroutine test_innerproduct_y_real32_matches_the_loop( )
+
+    implicit none
+
+    real(real32), pointer :: first( : )  => null()
+    real(real32), pointer :: second( : ) => null()
+    real(real64)          :: reference, answer
+    integer(i_def)        :: df
+    logical(l_def)        :: handled
+
+    allocate( first(length) )
+    allocate( second(length) )
+    do df = 1, length
+      first(df)  = real(df, real32) * 0.5_real32
+      second(df) = real(length - df + 1_i_def, real32) * 0.125_real32
+    end do
+
+    reference = 0.0_real64
+    do df = 1, length
+      reference = reference + real(first(df), real64) * real(second(df), real64)
+    end do
+
+    handled = kokkos_reduce_innerproduct_y( first, second, length, answer )
+
+    if ( handled ) then
+      @assertEqual(reference, answer)
+    else
+      @assertFalse(kokkos_reduce_enabled())
+    end if
+
+    deallocate( first )
+    deallocate( second )
+
+  end subroutine test_innerproduct_y_real32_matches_the_loop
+
+  !> Test the two-field inner product on the other real kind.
+  !>
+  @test
+  subroutine test_innerproduct_y_real64_matches_the_loop( )
+
+    implicit none
+
+    real(real64), pointer :: first( : )  => null()
+    real(real64), pointer :: second( : ) => null()
+    real(real64)          :: reference, answer
+    integer(i_def)        :: df
+    logical(l_def)        :: handled
+
+    allocate( first(length) )
+    allocate( second(length) )
+    do df = 1, length
+      first(df)  = real(df, real64) * 0.25_real64
+      second(df) = real(length - df + 1_i_def, real64) * 0.0625_real64
+    end do
+
+    reference = 0.0_real64
+    do df = 1, length
+      reference = reference + first(df) * second(df)
+    end do
+
+    handled = kokkos_reduce_innerproduct_y( first, second, length, answer )
+
+    if ( handled ) then
+      @assertEqual(reference, answer)
+    else
+      @assertFalse(kokkos_reduce_enabled())
+    end if
+
+    deallocate( first )
+    deallocate( second )
+
+  end subroutine test_innerproduct_y_real64_matches_the_loop
+
+  !> Test that the one-pass min and max agree with the loop they replace.
+  !>
+  !> @details The data is signed and its extremes are not at its ends, so a
+  !>          reduction that quietly returned the first or last element, or
+  !>          that lost the sign, would be caught.
+  !>
+  @test
+  subroutine test_min_max_matches_the_loop( )
+
+    implicit none
+
+    real(real64), pointer :: field( : ) => null()
+    real(real64)          :: smallest, largest
+    real(real64)          :: least, most
+    integer(i_def)        :: df
+    logical(l_def)        :: handled
+
+    allocate( field(length) )
+    do df = 1, length
+      field(df) = sin( real(df, real64) ) * real(df, real64)
+    end do
+
+    least = huge(0.0_real64)
+    most  = -huge(0.0_real64)
+    do df = 1, length
+      least = min( least, field(df) )
+      most  = max( most,  field(df) )
+    end do
+
+    handled = kokkos_reduce_min_max( field, length, smallest, largest )
+
+    if ( handled ) then
+      @assertEqual(least, smallest)
+      @assertEqual(most,  largest)
+    else
+      @assertFalse(kokkos_reduce_enabled())
+    end if
+
+    deallocate( field )
+
+  end subroutine test_min_max_matches_the_loop
+
+  !> Test that a request naming fewer dofs than the array holds reduces over
+  !> the dofs it named and no further.
+  !>
+  !> @details Fields carry halo dofs past their owned count, so the partial
+  !>          case is the ordinary one rather than an edge.
+  !>
+  @test
+  subroutine test_a_partial_request_stops_at_the_owned_count( )
+
+    implicit none
+
+    real(real64), pointer     :: field( : ) => null()
+    integer(i_def), parameter :: owned = length / 2_i_def
+    real(real64)              :: reference, answer
+    integer(i_def)            :: df
+    logical(l_def)            :: handled
+
+    allocate( field(length) )
+    do df = 1, length
+      field(df) = real(df, real64)
+    end do
+
+    reference = 0.0_real64
+    do df = 1, owned
+      reference = reference + field(df)**2
+    end do
+
+    handled = kokkos_reduce_innerproduct_x( field, owned, answer )
+
+    if ( handled ) then
+      @assertEqual(reference, answer)
+    else
+      @assertFalse(kokkos_reduce_enabled())
+    end if
+
+    deallocate( field )
+
+  end subroutine test_a_partial_request_stops_at_the_owned_count
+
+  !> Test that the storage question answers no for memory the shared
+  !> allocator did not issue.
+  !>
+  !> @details Without USE_KOKKOS the allocator's Fortran face is a plain
+  !>          ALLOCATE and nothing is ever owned, so this holds for both
+  !>          arrays here. In a Kokkos build the first would be owned and the
+  !>          second would not; the distinction is what decides a launch, and
+  !>          it is asserted in tests/test_kokkos_reduce.sh where both arms
+  !>          exist.
+  !>
+  @test
+  subroutine test_ownership_is_false_for_a_plain_allocation( )
+
+    implicit none
+
+    real(real64), pointer :: field( : ) => null()
+
+    @assertFalse(kokkos_shared_owns(field))
+
+    allocate( field(length) )
+
+    @assertFalse(kokkos_shared_owns(field))
+
+    deallocate( field )
+
+  end subroutine test_ownership_is_false_for_a_plain_allocation
+
+  !> Test that the three refusals a caller can provoke all leave it to run
+  !> its own loop.
+  !>
+  !> @details A null pointer, no dof to reduce over, and an array shorter than
+  !>          the dof count the request named. None of them may be served, and
+  !>          none of them may stop the run: the caller's loop is always there
+  !>          to fall back to.
+  !>
+  @test
+  subroutine test_the_refusals_leave_the_loop_to_the_caller( )
+
+    implicit none
+
+    real(real64), pointer :: absent( : ) => null()
+    real(real64), pointer :: field( : )  => null()
+    real(real64)          :: answer, smallest, largest
+
+    @assertFalse(kokkos_reduce_innerproduct_x( absent, length, answer ))
+
+    allocate( field(length) )
+    field(:) = 1.0_real64
+
+    @assertFalse(kokkos_reduce_innerproduct_x( field, 0_i_def, answer ))
+    @assertFalse(kokkos_reduce_innerproduct_x( field, length * 2_i_def, answer ))
+    @assertFalse(kokkos_reduce_min_max( field, 0_i_def, smallest, largest ))
+
+    deallocate( field )
+
+  end subroutine test_the_refusals_leave_the_loop_to_the_caller
+
+  !> Test that refusals made with the knob off are not counted.
+  !>
+  !> @details The counters describe a lever that was asked to work. In this
+  !>          build the knob cannot come on, so every refusal above was made
+  !>          with it off and the fallback count is still zero -- which is how
+  !>          a null measurement is told from a knob that never came on.
+  !>
+  @test
+  subroutine test_refusals_with_the_knob_off_are_not_counted( )
+
+    implicit none
+
+    @assertEqual(0_i_long, kokkos_reduce_calls())
+    @assertEqual(0_i_long, kokkos_reduce_fallbacks())
+
+  end subroutine test_refusals_with_the_knob_off_are_not_counted
+
+end module kokkos_reduce_mod_test

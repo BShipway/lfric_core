@@ -120,6 +120,7 @@ contains
       use omp_lib,            only: omp_get_thread_num
       use omp_lib,            only: omp_get_max_threads
       use mesh_mod,           only: mesh_type
+      use kokkos_reduce_mod,  only: kokkos_reduce_innerproduct_x
 
       implicit none
 
@@ -135,6 +136,11 @@ contains
       type(r_solver_field_proxy_type)             :: field_proxy
       integer(kind=i_def)                         :: max_halo_depth_mesh
       type(mesh_type), pointer                    :: mesh => null()
+      !> The sum a Kokkos reduction computed, when one was run in place of
+      !> the loop below. See kokkos_reduce_mod: the request is refused and
+      !> this loop runs whenever the knob is off, the build has no Kokkos or
+      !> the field's storage is not the shared allocator's.
+      real(kind=r_double)                         :: device_norm
       !
       ! Determine the number of OpenMP threads
       !
@@ -160,6 +166,18 @@ contains
       ! Zero summation variables
       !
       field_norm = 0.0_r_def
+      !
+      ! Ask for the reduction to be run where the field's pages are. A field
+      ! held in shared space is read by the generated Kokkos regions, so on a
+      ! card this loop would fault the whole field back to the host for a
+      ! single scalar. The request is refused -- and the loop below runs
+      ! unchanged -- unless LFRIC_KOKKOS_LITE_REDUCE is on and the storage is
+      ! the shared allocator's.
+      !
+      if ( kokkos_reduce_innerproduct_x( field_proxy%data, loop0_stop,       &
+                                         device_norm ) ) then
+        field_norm = real(device_norm,r_def)
+      else
       ALLOCATE (l_field_norm(nthreads))
       l_field_norm = 0.0_r_double
       !
@@ -178,6 +196,7 @@ contains
         field_norm = field_norm+real(l_field_norm(th_idx),r_def)
       END DO
       DEALLOCATE (l_field_norm)
+      end if
       global_sum%value = field_norm
       field_norm = global_sum%get_sum()
       !
@@ -194,6 +213,7 @@ contains
       use omp_lib,            only: omp_get_thread_num
       use omp_lib,            only: omp_get_max_threads
       use mesh_mod,           only: mesh_type
+      use kokkos_reduce_mod,  only: kokkos_reduce_innerproduct_y
 
       implicit none
 
@@ -209,6 +229,9 @@ contains
       type(r_solver_field_proxy_type)             :: field1_proxy, field2_proxy
       integer(kind=i_def)                         :: max_halo_depth_mesh
       type(mesh_type), pointer                    :: mesh => null()
+      !> The sum a Kokkos reduction computed, when one was run in place of
+      !> the loop below; see invoke_rdouble_X_innerproduct_X.
+      real(kind=r_double)                         :: device_norm
       !
       ! Determine the number of OpenMP threads
       !
@@ -235,6 +258,17 @@ contains
       ! Zero summation variables
       !
       field_norm = 0.0_r_def
+      !
+      ! As invoke_rdouble_X_innerproduct_X: the reduction is offered to the
+      ! card first, and this loop runs whenever the offer is refused. Both
+      ! fields have to be the shared allocator's, because one launch reads
+      ! both.
+      !
+      if ( kokkos_reduce_innerproduct_y( field1_proxy%data,                 &
+                                         field2_proxy%data, loop0_stop,     &
+                                         device_norm ) ) then
+        field_norm = real(device_norm,r_def)
+      else
       ALLOCATE (l_field_norm(nthreads))
       l_field_norm = 0.0_r_double
       !
@@ -253,6 +287,7 @@ contains
         field_norm = field_norm+real(l_field_norm(th_idx),r_def)
       END DO
       DEALLOCATE (l_field_norm)
+      end if
       global_sum%value = field_norm
       field_norm = global_sum%get_sum()
       !
