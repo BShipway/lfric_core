@@ -109,6 +109,7 @@ contains
     use omp_lib,            only: omp_get_max_threads
     use field_real64_mod,   only: field_real64_type, &
                                   field_real64_proxy_type
+    use kokkos_reduce_mod,  only: kokkos_reduce_min_max
 
     implicit none
 
@@ -125,6 +126,11 @@ contains
     integer(kind=i_def)                          :: loop0_stop
     integer(kind=i_def)                          :: nthreads
     type(field_real64_proxy_type)                :: field_proxy
+    !> The two answers a Kokkos reduction computed, when one was run in place
+    !> of the loop below. See kokkos_reduce_mod: the request is refused and
+    !> the loop runs whenever the knob is off, the build has no Kokkos or the
+    !> field's storage is not the shared allocator's.
+    real(kind=real64)                            :: device_min, device_max
     !
     ! Determine the number of OpenMP threads
     !
@@ -143,6 +149,19 @@ contains
     !
     ! Call kernels and communication routines
     !
+    !
+    ! Ask for the reduction to be run where the field's pages are; a field
+    ! held in shared space is read by the generated Kokkos regions, so on a
+    ! card this loop would fault the whole field back to the host for two
+    ! scalars. The request is refused -- and the loop below runs unchanged --
+    ! unless LFRIC_KOKKOS_LITE_REDUCE is on and the storage is the shared
+    ! allocator's.
+    !
+    if ( kokkos_reduce_min_max( field_proxy%data, loop0_stop, &
+                                device_min, device_max ) ) then
+      field_min_norm = device_min
+      field_max_norm = device_max
+    else
     allocate (l_field_min_norm(nthreads))
     allocate (l_field_max_norm(nthreads))
     !
@@ -170,6 +189,7 @@ contains
       field_max_norm = max(field_max_norm, l_field_max_norm(th_idx))
     end do
     deallocate (l_field_min_norm, l_field_max_norm)
+    end if
     global_min%value = field_min_norm
     global_max%value = field_max_norm
     field_min_norm = global_min%get_min()

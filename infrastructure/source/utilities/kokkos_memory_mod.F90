@@ -86,6 +86,7 @@ module kokkos_memory_mod
             kokkos_shared_report,             &
             kokkos_shared_report_lifetime,    &
             kokkos_shared_name_refusal,       &
+            kokkos_shared_owns,               &
             kokkos_shared_in_use
 
   !> @brief One block this module has claimed and still owns.
@@ -208,6 +209,14 @@ module kokkos_memory_mod
     module procedure kokkos_shared_free_int32
   end interface kokkos_shared_free
 
+  !> @brief Reports whether the shared allocator issued the storage an array
+  !>        is associated with.
+  interface kokkos_shared_owns
+    module procedure kokkos_shared_owns_real32
+    module procedure kokkos_shared_owns_real64
+    module procedure kokkos_shared_owns_int32
+  end interface kokkos_shared_owns
+
 #ifdef USE_KOKKOS
   interface
 
@@ -255,6 +264,18 @@ module kokkos_memory_mod
       type(c_ptr), value, intent(in) :: address
       integer(c_size_t) :: index
     end function lfric_kokkos_shared_index
+
+    !> Returns 1 if the allocator issued this address and has not reclaimed
+    !> it, and 0 otherwise. Distinct from the index query above, which
+    !> answers zero for an address it never issued and for one it issued
+    !> without a registry entry owning it alike.
+    function lfric_kokkos_shared_owns( address )                             &
+             bind(c, name='lfric_kokkos_shared_owns') result(owns)
+      import :: c_ptr, c_int
+      implicit none
+      type(c_ptr), value, intent(in) :: address
+      integer(c_int) :: owns
+    end function lfric_kokkos_shared_owns
 
     !> Records the one-based registry index owning an address. Does nothing
     !> if the allocator did not issue that address.
@@ -1503,6 +1524,83 @@ contains
     flush( error_unit )
 
   end subroutine kokkos_shared_report_lifetime
+
+  !> @brief Reports whether the shared allocator issued a 32-bit real array's
+  !>        storage.
+  !> @details The question a caller asks before handing an address to code
+  !>          that takes a device view of it: a block from ALLOCATE is host
+  !>          memory and a block from the shared allocator is reachable from
+  !>          both sides, and nothing about the array itself says which.
+  !>          kokkos_shared_index cannot answer it, because the zero it
+  !>          returns for an address it never issued is the same zero it
+  !>          returns for one it issued and no registry entry owns -- the
+  !>          state of every block kokkos_shared_allocate hands out.
+  !>
+  !>          False in a build without USE_KOKKOS, where there is no shared
+  !>          allocator, and false for an unassociated or zero-sized array,
+  !>          which has no first element to take the address of.
+  !> @param [in] array   Array to ask about.
+  !> @return owns        Whether the shared allocator issued its storage.
+  function kokkos_shared_owns_real32( array ) result(owns)
+
+    implicit none
+
+    real(real32), pointer, intent(in) :: array( : )
+    logical(l_def) :: owns
+
+    owns = .false._l_def
+    if ( .not. associated(array) ) return
+    if ( size(array) < 1 ) return
+
+#ifdef USE_KOKKOS
+    owns = ( lfric_kokkos_shared_owns( c_loc(array(1)) ) /= 0_c_int )
+#endif
+
+  end function kokkos_shared_owns_real32
+
+  !> @brief Reports whether the shared allocator issued a 64-bit real array's
+  !>        storage.
+  !> @details As kokkos_shared_owns_real32, for the other real kind.
+  !> @param [in] array   Array to ask about.
+  !> @return owns        Whether the shared allocator issued its storage.
+  function kokkos_shared_owns_real64( array ) result(owns)
+
+    implicit none
+
+    real(real64), pointer, intent(in) :: array( : )
+    logical(l_def) :: owns
+
+    owns = .false._l_def
+    if ( .not. associated(array) ) return
+    if ( size(array) < 1 ) return
+
+#ifdef USE_KOKKOS
+    owns = ( lfric_kokkos_shared_owns( c_loc(array(1)) ) /= 0_c_int )
+#endif
+
+  end function kokkos_shared_owns_real64
+
+  !> @brief Reports whether the shared allocator issued a 32-bit integer
+  !>        array's storage.
+  !> @details As kokkos_shared_owns_real32, for the integer kind.
+  !> @param [in] array   Array to ask about.
+  !> @return owns        Whether the shared allocator issued its storage.
+  function kokkos_shared_owns_int32( array ) result(owns)
+
+    implicit none
+
+    integer(int32), pointer, intent(in) :: array( : )
+    logical(l_def) :: owns
+
+    owns = .false._l_def
+    if ( .not. associated(array) ) return
+    if ( size(array) < 1 ) return
+
+#ifdef USE_KOKKOS
+    owns = ( lfric_kokkos_shared_owns( c_loc(array(1)) ) /= 0_c_int )
+#endif
+
+  end function kokkos_shared_owns_int32
 
   !> @brief Reports whether the shared allocator has ever issued a block.
   !> @details "Is Kokkos in use" has no single answer, because a build may

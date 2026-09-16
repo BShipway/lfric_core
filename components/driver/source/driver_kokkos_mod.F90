@@ -31,6 +31,8 @@ module driver_kokkos_mod
                                kokkos_shared_report, &
                                kokkos_shared_report_lifetime
 
+  use kokkos_reduce_mod, only: kokkos_reduce_report
+
   implicit none
 
   private
@@ -98,6 +100,12 @@ contains
 
     call kokkos_shared_release_all()
     call kokkos_shared_report()
+
+    ! What LFRIC_KOKKOS_LITE_REDUCE resolved to, and how many of the science
+    ! component's PSyKAl-lite reductions were launched rather than looped.
+    ! Beside the allocator's line, and before Kokkos::finalize for the same
+    ! reason: it is a knob, and a run says what its knobs resolved to.
+    call kokkos_reduce_report()
 
 #ifdef USE_KOKKOS
     call lfric_kokkos_finalise()
