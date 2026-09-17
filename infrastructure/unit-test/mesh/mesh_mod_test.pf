@@ -335,6 +335,13 @@ contains
     test_integer = mesh_1%get_cell_next( 3, 18 )
     @assertEqual ( 0, test_integer )
 
+    ! The whole-array form answers the same questions
+    cell_next_all => mesh_1%get_cell_next()
+    @assertEqual ( mesh_1%get_nfaces_per_cell(), size( cell_next_all, 1 ) )
+    @assertEqual ( 32, cell_next_all( 6, 23 ) )
+    @assertEqual ( 0,  cell_next_all( 3, 9 ) )
+    @assertEqual ( 0,  cell_next_all( 3, 18 ) )
+
     !-------------------------------------------------------------------
     ! Test get_face_on_cell()
     test_integer = mesh_1%get_face_on_cell( 3, 9 )

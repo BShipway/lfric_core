@@ -226,7 +226,10 @@ module mesh_mod
     procedure, public :: get_nedges_per_cell
     procedure, public :: get_nedges_per_cell_2d
     procedure, public :: get_nfaces_per_cell
-    procedure, public :: get_cell_next
+    procedure, private :: get_cell_next_face
+    procedure, private :: get_cell_next_all
+    generic,   public  :: get_cell_next => get_cell_next_face, &
+                                           get_cell_next_all
     procedure, public :: get_face_on_cell
     procedure, public :: get_edge_on_cell
     procedure, public :: get_vert_on_cell
@@ -959,7 +962,7 @@ contains
   !>                          known cell  ( @c cell_lid ) with the
   !>                          common face ( @c iface )
   !============================================================================
-  function get_cell_next(self, iface, cell_lid) result (cell_next_lid)
+  function get_cell_next_face(self, iface, cell_lid) result (cell_next_lid)
 
     ! Returns local cell id of adjacent cell on the
     ! specified face (iface) of the given cell (cell_lid)
@@ -972,7 +975,23 @@ contains
 
     cell_next_lid = self%cell_next(iface, cell_lid)
 
-  end function get_cell_next
+  end function get_cell_next_face
+
+  !============================================================================
+  !> @brief Gets the local ids of the cells adjacent to every face of
+  !>        every cell.
+  !> @return Pointer to the connectivity array, indexed (face, cell local
+  !>         id); zero where no cell lies across the face.
+  !============================================================================
+  function get_cell_next_all(self) result (cell_next)
+
+    implicit none
+    class(mesh_type), target, intent(in) :: self
+    integer(i_def),   pointer            :: cell_next(:,:)
+
+    cell_next => self%cell_next(:,:)
+
+  end function get_cell_next_all
 
 
   !> @details This function returns the local face id on local cell

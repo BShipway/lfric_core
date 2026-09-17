@@ -179,6 +179,7 @@ module argument_mod
   !> @defgroup mesh_data_items Enumeration of mesh data items.
   !> @{
   integer, public, parameter :: adjacent_face = 533
+  integer, public, parameter :: cell_next     = 534
   !> @}
 
   !> @defgroup operates_on Enumeration of kernel iterator property descriptors.
@@ -254,7 +255,8 @@ module argument_mod
   end type reference_element_data_type
 
   !> Optional metadata for the mesh data, stored in the `mesh_data_type` type as
-  !! an array of `meta_mesh` (currently only supports `adjacent_face` array).
+  !! an array of `meta_mesh` (supports the `adjacent_face` and `cell_next`
+  !! arrays).
   type, public :: mesh_data_type
     integer :: mesh_data_item
   end type mesh_data_type
