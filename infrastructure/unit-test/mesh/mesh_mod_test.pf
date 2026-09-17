@@ -239,6 +239,7 @@ contains
     type(local_mesh_type), pointer :: local_mesh_ptr
 
     integer(i_def) :: test_integer
+    integer(i_def), pointer :: cell_next_all(:,:)
 
     local_mesh_ptr => this%get_local_mesh_ptr()
 
@@ -333,6 +334,17 @@ contains
     @assertEqual ( 0, test_integer )
 
     test_integer = mesh_1%get_cell_next( 3, 18 )
+    @assertEqual ( 0, test_integer )
+
+    ! The whole-array form answers the same questions
+    cell_next_all => mesh_1%get_cell_next()
+    test_integer = size( cell_next_all, 1 )
+    @assertEqual ( 6, test_integer )
+    test_integer = cell_next_all( 6, 23 )
+    @assertEqual ( 32, test_integer )
+    test_integer = cell_next_all( 3, 9 )
+    @assertEqual ( 0, test_integer )
+    test_integer = cell_next_all( 3, 18 )
     @assertEqual ( 0, test_integer )
 
     !-------------------------------------------------------------------
