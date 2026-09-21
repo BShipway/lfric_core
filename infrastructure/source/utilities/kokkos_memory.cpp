@@ -240,8 +240,23 @@ bool pooling()
 // run meeting many distinct sizes would keep a spare of each for ever, and
 // device memory is the scarce resource on this card. Past the bound a
 // released block goes back to the driver as it did before the pool existed.
-// The default is generous against the model's own field set -- C144's peak is
-// a little over a gigabyte -- and small against an H100's 94 GB.
+//
+// The compiled-in default is C48's number, and was wrong about C144's before
+// Task G3 (docs/plans/2026-09-18-multi-gpu-general-levers.md) measured it:
+// this comment used to say "C144's peak is a little over a gigabyte", which
+// was never checked against the allocator's own peak counter. It is not --
+// the C144_MG one-rank peak is about 18.6 GB
+// (validation/performance/phase-7-c144-allocations-2026-09-18/), nine times
+// C48's 2.18 GB, which is exactly the ratio of cell counts. Against a 4 GB
+// bound that peak cannot be held, so every step the free list evicts
+// whichever sizes do not fit and the driver sees a fresh
+// `cudaMallocManaged`/`cudaFree` pair for them -- about 404 a step, each
+// still paying the two Kokkos fences a managed allocation and free cost.
+// `bin/run-gungho-model` raises LFRIC_KOKKOS_SHARED_POOL_MB for a device run
+// so the pool can hold the whole C144 one-rank working set; the compiled-in
+// default here is left at C48's figure for every other caller (the pFUnit
+// probe, a host build, a future mesh nobody has sized yet), because raising
+// it here would be a guess and raising it there is a measurement.
 std::size_t pool_limit()
 {
   static const std::size_t bytes = [] {
@@ -482,17 +497,23 @@ extern "C" std::size_t lfric_kokkos_shared_peak_bytes()
 // before it finalises Kokkos, so no logger exists by the time this is called.
 // The prefix through "blocks" is matched by psy-ir-aidev's
 // tests/test_field_data_is_shared.sh and read by bin/measure-timestep, so it
-// is kept exactly; the advice fields are appended after it.
+// is kept exactly; the advice fields are appended after it. limit_bytes= is
+// Task G3's addition: LFRIC_KOKKOS_SHARED_POOL_MB already resolved to a
+// number before this task, but nothing on the line said what -- the bound
+// that decided whether C144's 18.6 GB working set could be held was
+// invisible to a reader of the log. Appended last, after released=, so it
+// does not move anything an existing matcher anchors on before it.
 extern "C" void lfric_kokkos_shared_report()
 {
   std::fprintf(stderr,
                "lfric_kokkos_shared: peak %zu bytes, "
                "%zu bytes live in %zu blocks, advice=%s advised=%zu refused=%zu "
-               "pool=%s reuses=%zu recycled=%zu held_peak=%zu released=%zu\n",
+               "pool=%s reuses=%zu recycled=%zu held_peak=%zu released=%zu "
+               "limit_bytes=%zu\n",
                peak_bytes, live_bytes, live_blocks,
                advice_name(), advised_blocks, advice_failures,
                pooling() ? "on" : "off", pool_reuses, pool_recycled,
-               pool_peak, pool_released);
+               pool_peak, pool_released, pool_limit());
 }
 
 // The free list's counters, for the Fortran face. Three questions a caller
