@@ -962,6 +962,9 @@ contains
   !>          far more than the gather costs. Refusing loudly is the point: a
   !>          silent fallback would make an A/B row read as a null lever.
   !>
+  !>          The device level is refused outright in a build without Kokkos,
+  !>          for the same reason: there is no kernel in that binary to run it.
+  !>
   !>          The host level is *not* refused under that advice, and the
   !>          difference is the reason the knob became a level. Level 1 is
   !>          host code from end to end -- it gathers on the host exactly as
@@ -992,6 +995,18 @@ contains
       end select
 
       if ( mode_level == mode_device ) then
+#ifndef USE_KOKKOS
+        ! A build without Kokkos has no gather kernel to run, and the device
+        ! branch of both exchange routines is not in it. Left alone, level 2
+        ! would quietly do exactly what level 1 does and report `mode=device`
+        ! beside `device=0`, which a reader would have to know this file to
+        ! disbelieve. Refusing says the true thing: this binary cannot do what
+        ! was asked.
+        call log_event(                                                      &
+            'halo_exchange_plan: ' // mode_variable // '=2 refused '      // &
+            'because this build has no Kokkos; level 1 is the host replay',  &
+            LOG_LEVEL_ERROR )
+#endif
         setting = ''
         call get_environment_variable( advice_variable, setting,             &
                                        status=status )
