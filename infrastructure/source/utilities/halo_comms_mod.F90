@@ -18,6 +18,11 @@ module halo_comms_mod
   use lfric_mpi_mod,         only: global_mpi, get_lfric_datatype, &
                                    lfric_comm_type, lfric_datatype_type
   use log_mod,               only: log_event, LOG_LEVEL_ERROR
+  use halo_exchange_plan_mod, only: halo_plan_type, halo_plan_build,     &
+                                    halo_plan_exchange_real32,           &
+                                    halo_plan_exchange_real64,           &
+                                    halo_plan_mode_enabled,              &
+                                    halo_plan_count_fallback
 #ifdef NO_MPI
   ! If this is a non-mpi build - YAXT won't work - so don't "use" it
 #else
@@ -122,15 +127,31 @@ module halo_comms_mod
     integer(i_def) :: halo_depth
     !> Number of redistribution map objects
     integer(i_def) :: max_depth
+    !> Dofs this rank owns, which is where the halo slab starts in the flat
+    !> array a halo exchange is handed. The exchange plan needs it and
+    !> nothing else here carries it.
+    integer(i_def) :: n_owned = 0
     !> YAXT redistribution map
 #ifdef NO_MPI
     ! If this is a non-mpi, serial build, redistribution maps are meaningless
     ! so we don't need one, but we need something  for get_redist to return
     ! so just use an integer
     integer(i_def), allocatable :: redist(:)
+    !> The exchange maps the redistributions were built from; an integer here
+    !> for the same reason.
+    integer(i_def), allocatable :: xmaps(:)
 #else
     type(xt_redist), allocatable :: redist(:)
+    !> The exchange maps the redistributions were built from. The
+    !> redistribution does not expose the lists it holds and the map does, so
+    !> a device-side exchange has to be able to reach back to the map that
+    !> made it.
+    type(xt_xmap), allocatable :: xmaps(:)
 #endif
+    !> One plan a depth, built the first time that depth is exchanged and
+    !> kept, because reading the lists out of a map is not work to repeat 361
+    !> times a step.
+    type(halo_plan_type), allocatable :: plans(:)
   contains
     !> Gets the mesh_id for which the halo_routing object is valid
     procedure, public :: get_mesh_id
@@ -319,11 +340,15 @@ function halo_routing_constructor( global_dof_id,   &
   self%fortran_kind = fortran_kind
   self%halo_depth = halo_depth
   self%max_depth = max_depth
+  self%n_owned = last_owned_dof
 
   allocate( self%redist(max_depth) )
+  allocate( self%xmaps(max_depth) )
+  allocate( self%plans(max_depth) )
 
 #ifdef NO_MPI
   self%redist(:) = 0
+  self%xmaps(:) = 0
   idepth=0 ! Set local variables to avoid unused variable errors
   xmap=0
 #else
@@ -335,6 +360,9 @@ do idepth = 1 ,max_depth
       xmap = generate_exchange_map(global_dof_id(1:last_owned_dof), &
                                        global_dof_id( halo_start(idepth):halo_finish(idepth) ))
     end if
+    ! Keep the map beside the redistribution it made. The redistribution
+    ! holds the same lists and does not expose them; the map does.
+    self%xmaps(idepth) = xmap
     ! Get the redistribution map objects for doing halo exchanges later
     self%redist(idepth) = generate_redistribution_map( &
                      global_dof_id(1:last_owned_dof), &
@@ -447,6 +475,12 @@ subroutine clear(self)
   end do
 #endif
   if (allocated(self%redist)) deallocate(self%redist)
+  ! The xmaps are not deleted here. When the routing was given an
+  ! exchange_maps object the maps belong to that object, and when it was not
+  ! they belong to the redistribution that generate_redistribution_map built
+  ! from them; either way this array holds handles it did not create.
+  if (allocated(self%xmaps)) deallocate(self%xmaps)
+  if (allocated(self%plans)) deallocate(self%plans)
 end subroutine clear
 
 !> @brief Gets a YAXT redistribution map for halo swapping
@@ -617,8 +651,26 @@ subroutine perform_halo_exchange_real32( data_with_halos, &
 #else
   type(xt_redist), pointer :: redist
 
-  ! Start a blocking (synchronous) halo exchange
   redist => halo_routing%get_redist(depth)
+
+  ! The 32-bit exchange takes the replay for the same reason the 64-bit one
+  ! does, and with more at stake: the baseline profile charges more of a
+  ! six-rank C144 step to this routine than to its 64-bit twin.
+  if ( halo_plan_mode_enabled() ) then
+    if ( .not. halo_routing%plans(depth)%is_built() ) then
+      call halo_plan_build( halo_routing%plans(depth),                        &
+                            halo_routing%xmaps(depth),                        &
+                            halo_routing%n_owned )
+    end if
+    if ( halo_routing%plans(depth)%is_served() ) then
+      call halo_plan_exchange_real32( data_with_halos,                        &
+                                      halo_routing%plans(depth), redist )
+      return
+    end if
+    call halo_plan_count_fallback()
+  end if
+
+  ! Start a blocking (synchronous) halo exchange
   call xt_redist_s_exchange(redist, data_with_halos, data_with_halos)
 #endif
 
@@ -644,8 +696,29 @@ subroutine perform_halo_exchange_real64( data_with_halos, &
 #else
   type(xt_redist), pointer :: redist
 
-  ! Start a blocking (synchronous) halo exchange
   redist => halo_routing%get_redist(depth)
+
+  ! With the replay asked for, gather and scatter here from YAXT's own lists
+  ! rather than letting MPI's datatype convertor walk the owned block. The
+  ! plan is read out of the exchange map once a depth and kept. INTENT(IN) on
+  ! a pointer dummy constrains the association, not the target, so the lazy
+  ! build is allowed; it is lazy so that a routing never exchanged costs
+  ! nothing.
+  if ( halo_plan_mode_enabled() ) then
+    if ( .not. halo_routing%plans(depth)%is_built() ) then
+      call halo_plan_build( halo_routing%plans(depth),                      &
+                            halo_routing%xmaps(depth),                      &
+                            halo_routing%n_owned )
+    end if
+    if ( halo_routing%plans(depth)%is_served() ) then
+      call halo_plan_exchange_real64( data_with_halos,                      &
+                                      halo_routing%plans(depth), redist )
+      return
+    end if
+    call halo_plan_count_fallback()
+  end if
+
+  ! Start a blocking (synchronous) halo exchange
   call xt_redist_s_exchange(redist, data_with_halos, data_with_halos)
 #endif
 
