@@ -33,6 +33,8 @@ module driver_kokkos_mod
 
   use kokkos_reduce_mod, only: kokkos_reduce_report
 
+  use halo_exchange_plan_mod, only: halo_plan_report
+
   implicit none
 
   private
@@ -106,6 +108,13 @@ contains
     ! Beside the allocator's line, and before Kokkos::finalize for the same
     ! reason: it is a knob, and a run says what its knobs resolved to.
     call kokkos_reduce_report()
+
+    ! What LFRIC_KOKKOS_HALO and its selfcheck resolved to, how many plans
+    ! were read out of exchange maps, how many exchanges the replay served,
+    ! and -- when the selfcheck ran -- how many halo words ever differed
+    ! from YAXT's. The last is the number the falsifier turns on, so it is
+    ! reported whether or not anyone asked for the check.
+    call halo_plan_report()
 
 #ifdef USE_KOKKOS
     call lfric_kokkos_finalise()
