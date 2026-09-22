@@ -72,10 +72,15 @@ module halo_exchange_plan_mod
 
   use, intrinsic :: iso_fortran_env, only : real32, real64,                  &
                                             int32, int64, error_unit
-  use, intrinsic :: iso_c_binding,   only : c_int
+  use, intrinsic :: iso_c_binding,   only : c_int, c_ptr, c_null_ptr,        &
+                                            c_associated, c_loc, c_f_pointer, &
+                                            c_size_t
 
-  use constants_mod, only : i_def, l_def, str_def
-  use log_mod,       only : log_event, LOG_LEVEL_ERROR
+  use constants_mod,    only : i_def, l_def, str_def
+  use log_mod,          only : log_event, LOG_LEVEL_ERROR
+  ! The device path only ever runs over storage the shared allocator issued,
+  ! and this is what says whether a given field's storage is that.
+  use kokkos_memory_mod, only : kokkos_shared_owns
 
 #ifdef NO_MPI
   ! Without MPI there are no neighbours, so there is nothing to plan.
@@ -110,6 +115,7 @@ module halo_exchange_plan_mod
   public :: halo_plan_build
   public :: halo_plan_exchange_real32, halo_plan_exchange_real64
   public :: halo_plan_mode_enabled, halo_plan_selfcheck_enabled
+  public :: halo_plan_device_enabled
   public :: halo_plan_report, halo_plan_count_fallback
 
   !> The name of the knob that turns the replay on.
@@ -121,6 +127,105 @@ module halo_exchange_plan_mod
   !> One tag for every message; the exchange is blocking, so only one is in
   !> flight between a pair at a time.
   integer, parameter :: halo_tag = 7241
+
+  !> What `LFRIC_KOKKOS_HALO` can say. The knob is a level rather than a flag
+  !> because the two things it turns on are separable and the separation is
+  !> worth measuring: level 1 replaces YAXT's exchange with the same exchange
+  !> driven from YAXT's own lists, all on the host, and level 2 additionally
+  !> moves the gather and the scatter to the card. An A/B of 0 against 1 says
+  !> what replacing the datatype convertor with a plain contiguous send is
+  !> worth on its own; 1 against 2 says what taking the gather off the host is
+  !> worth. Anything else is off.
+  integer(i_def), parameter :: mode_off    = 0_i_def
+  integer(i_def), parameter :: mode_host   = 1_i_def
+  integer(i_def), parameter :: mode_device = 2_i_def
+
+#ifdef USE_KOKKOS
+  !> The C++ half, in `kokkos_halo.cpp`. Every one of these is called only
+  !> after the caller has established that the field's storage came from the
+  !> shared allocator, so none of them has to decide whether the card can
+  !> reach the pointer it is handed.
+  interface
+
+    function lfric_kokkos_halo_create( send_index, n_send,                   &
+                                       recv_index, n_recv,                   &
+                                       element_bytes )                       &
+             bind(c, name='lfric_kokkos_halo_create') result(handle)
+      import :: c_ptr, c_size_t, c_int
+      implicit none
+      type(c_ptr),            value :: send_index
+      integer(c_size_t),      value :: n_send
+      type(c_ptr),            value :: recv_index
+      integer(c_size_t),      value :: n_recv
+      integer(c_int),         value :: element_bytes
+      type(c_ptr) :: handle
+    end function lfric_kokkos_halo_create
+
+    subroutine lfric_kokkos_halo_destroy( handle )                           &
+               bind(c, name='lfric_kokkos_halo_destroy')
+      import :: c_ptr
+      implicit none
+      type(c_ptr), value :: handle
+    end subroutine lfric_kokkos_halo_destroy
+
+    function lfric_kokkos_halo_send_host( handle )                           &
+             bind(c, name='lfric_kokkos_halo_send_host') result(buffer)
+      import :: c_ptr
+      implicit none
+      type(c_ptr), value :: handle
+      type(c_ptr) :: buffer
+    end function lfric_kokkos_halo_send_host
+
+    function lfric_kokkos_halo_recv_host( handle )                           &
+             bind(c, name='lfric_kokkos_halo_recv_host') result(buffer)
+      import :: c_ptr
+      implicit none
+      type(c_ptr), value :: handle
+      type(c_ptr) :: buffer
+    end function lfric_kokkos_halo_recv_host
+
+    function lfric_kokkos_halo_gather_real32( handle, field, n_field )       &
+             bind(c, name='lfric_kokkos_halo_gather_real32') result(served)
+      import :: c_ptr, c_size_t, c_int
+      implicit none
+      type(c_ptr),       value :: handle
+      type(c_ptr),       value :: field
+      integer(c_size_t), value :: n_field
+      integer(c_int) :: served
+    end function lfric_kokkos_halo_gather_real32
+
+    function lfric_kokkos_halo_gather_real64( handle, field, n_field )       &
+             bind(c, name='lfric_kokkos_halo_gather_real64') result(served)
+      import :: c_ptr, c_size_t, c_int
+      implicit none
+      type(c_ptr),       value :: handle
+      type(c_ptr),       value :: field
+      integer(c_size_t), value :: n_field
+      integer(c_int) :: served
+    end function lfric_kokkos_halo_gather_real64
+
+    function lfric_kokkos_halo_scatter_real32( handle, field, n_field )      &
+             bind(c, name='lfric_kokkos_halo_scatter_real32') result(served)
+      import :: c_ptr, c_size_t, c_int
+      implicit none
+      type(c_ptr),       value :: handle
+      type(c_ptr),       value :: field
+      integer(c_size_t), value :: n_field
+      integer(c_int) :: served
+    end function lfric_kokkos_halo_scatter_real32
+
+    function lfric_kokkos_halo_scatter_real64( handle, field, n_field )      &
+             bind(c, name='lfric_kokkos_halo_scatter_real64') result(served)
+      import :: c_ptr, c_size_t, c_int
+      implicit none
+      type(c_ptr),       value :: handle
+      type(c_ptr),       value :: field
+      integer(c_size_t), value :: n_field
+      integer(c_int) :: served
+    end function lfric_kokkos_halo_scatter_real64
+
+  end interface
+#endif
 
   !> @details What one exchange needs to know, for one routing at one depth.
   !>          `send_index` and `recv_index` are one-based indices into
@@ -169,6 +274,18 @@ module halo_exchange_plan_mod
 #else
     type(mpi_request), allocatable :: requests(:)
 #endif
+    !> The C++ side's plan: the index lists on the card and the two pinned
+    !> mirrors. Null until the first exchange this plan serves in device mode,
+    !> and null for good if that attempt decided the device path cannot serve
+    !> this plan -- `device_tried` is what stops the decision being retaken on
+    !> every one of the several hundred exchanges a step.
+    !>
+    !> Nothing deletes the handle. The plan is cached for the life of the run
+    !> and freeing a Kokkos View after `Kokkos::finalize` is an error, so the
+    !> forty-seven handles a run creates are held to the end, exactly as the
+    !> exchange maps beside them are.
+    type(c_ptr)    :: device_handle = c_null_ptr
+    logical(l_def) :: device_tried  = .false._l_def
   contains
     procedure, public :: is_built
     procedure, public :: is_served
@@ -179,8 +296,8 @@ module halo_exchange_plan_mod
   end type halo_plan_type
 
   !> The knobs, read once each.
-  logical(l_def), save :: mode_decided = .false._l_def
-  logical(l_def), save :: mode_on      = .false._l_def
+  logical(l_def), save :: mode_decided  = .false._l_def
+  integer(i_def), save :: mode_level    = mode_off
   logical(l_def), save :: check_decided = .false._l_def
   logical(l_def), save :: check_on      = .false._l_def
 
@@ -190,6 +307,19 @@ module halo_exchange_plan_mod
   integer(i_def), save :: n_fallbacks = 0
   integer(i_def), save :: n_checked   = 0
   integer(i_def), save :: n_mismatch  = 0
+  !> Exchanges the device path packed, and exchanges that asked for it and were
+  !> served by the host replay instead. The second is not a failure: a field
+  !> whose storage did not come from the shared allocator has nothing on the
+  !> card to gather from, and the host replay is the right answer for it. Both
+  !> are reported because which of them a run lands on is the thing most likely
+  !> to differ between one rank and six, or between this card and Phase 8's.
+  integer(i_def), save :: n_device      = 0
+  integer(i_def), save :: n_device_host = 0
+  !> MPI messages posted, counting both directions. This is the number Phase 8
+  !> has to size -- a rank's exchange cost is set by how many partners it talks
+  !> to, not by how many exchanges it performs -- and the plan asks for it
+  !> because nothing else in the run reports it.
+  integer(i_def), save :: n_messages  = 0
 
 contains
 
@@ -499,7 +629,12 @@ contains
     implicit none
 
     real(real64),         intent(inout), pointer :: data_with_halos(:)
-    type(halo_plan_type), intent(inout)          :: self
+    ! TARGET, so that the two buffer pointers below can be aimed either at the
+    ! plan's own host buffers or at the pinned mirrors the card packs into. The
+    ! MPI block is then written once and does not know which of the two it is
+    ! sending, which is the whole reason the device path is a change of two
+    ! pointers rather than a second copy of the exchange.
+    type(halo_plan_type), intent(inout), target  :: self
     type(xt_redist),      intent(in),    pointer :: redist
 
 #ifdef LEGACY_MPI
@@ -512,6 +647,8 @@ contains
     integer(i_def)             :: i, k, first, last, n_words, n_requests
     integer(i_def)             :: mismatches
     real(real64), allocatable, target :: reference(:)
+    real(real64), pointer      :: send_buf(:), recv_buf(:)
+    logical(l_def)             :: on_device
 
     if ( .not. self%served ) return
 
@@ -519,6 +656,8 @@ contains
       allocate( self%send_buffer(max(size(self%send_index), 1)) )
       allocate( self%recv_buffer(max(size(self%recv_index), 1)) )
     end if
+    send_buf => self%send_buffer
+    recv_buf => self%recv_buffer
 
     if ( halo_plan_selfcheck_enabled() ) then
       allocate( reference(size(data_with_halos)) )
@@ -537,9 +676,37 @@ contains
     comm%mpi_val = lfric_comm%get_comm_mpi_val()
 #endif
 
-    do k = 1, size(self%send_index)
-      self%send_buffer(k) = data_with_halos(self%send_index(k))
-    end do
+    ! The gather. On the card when the mode asks for it, the plan has a device
+    ! handle and this particular field's storage came from the shared
+    ! allocator; on the host otherwise, and the count of each is reported. The
+    ! device gather leaves the packed message in a pinned mirror, so what
+    ! changes below is only where `send_buf` points.
+    on_device = .false._l_def
+#ifdef USE_KOKKOS
+    ! The mode is asked first and on its own, because `kokkos_shared_owns` is a
+    ! registry lookup and Fortran does not promise to skip an argument whose
+    ! value the callee will not use.
+    if ( halo_plan_device_enabled() ) then
+      if ( halo_plan_device_ready( self, 8_c_int,                             &
+                                   kokkos_shared_owns(data_with_halos) ) ) then
+        on_device = ( lfric_kokkos_halo_gather_real64(                        &
+                        self%device_handle, c_loc(data_with_halos(1)),        &
+                        int(size(data_with_halos), c_size_t) ) /= 0_c_int )
+      end if
+      if ( on_device ) then
+        call halo_plan_device_mirrors_real64( self, send_buf, recv_buf )
+        n_device = n_device + 1
+      else
+        n_device_host = n_device_host + 1
+      end if
+    end if
+#endif
+
+    if ( .not. on_device ) then
+      do k = 1, size(self%send_index)
+        send_buf(k) = data_with_halos(self%send_index(k))
+      end do
+    end if
 
     n_requests = 0
 
@@ -554,7 +721,7 @@ contains
       first = self%src_start(i)
       last  = first + n_words - 1
       n_requests = n_requests + 1
-      call mpi_irecv( self%recv_buffer(first:last), int(n_words),             &
+      call mpi_irecv( recv_buf(first:last), int(n_words),                     &
                       mpi_double_precision,                                   &
                       int(self%src_rank(i)), halo_tag, comm,                  &
                       self%requests(n_requests), ierr )
@@ -566,7 +733,7 @@ contains
       first = self%dest_start(i)
       last  = first + n_words - 1
       n_requests = n_requests + 1
-      call mpi_isend( self%send_buffer(first:last), int(n_words),             &
+      call mpi_isend( send_buf(first:last), int(n_words),                     &
                       mpi_double_precision,                                   &
                       int(self%dest_rank(i)), halo_tag, comm,                 &
                       self%requests(n_requests), ierr )
@@ -577,11 +744,32 @@ contains
                         mpi_statuses_ignore, ierr )
     end if
 
-    do k = 1, size(self%recv_index)
-      data_with_halos(self%recv_index(k)) = self%recv_buffer(k)
-    end do
+#ifdef USE_KOKKOS
+    if ( on_device ) then
+      ! The scatter fences before it returns, so the halo is readable by the
+      ! host on the next line -- which the selfcheck below is.
+      if ( lfric_kokkos_halo_scatter_real64(                                  &
+             self%device_handle, c_loc(data_with_halos(1)),                   &
+             int(size(data_with_halos), c_size_t) ) == 0_c_int ) then
+        ! Cannot happen: the same handle served the gather a few lines above.
+        ! It is checked rather than assumed because the alternative to noticing
+        ! is a halo left holding the previous step's values, which is a wrong
+        ! answer that runs to completion.
+        call log_event( 'halo_exchange_plan: device scatter refused a plan '  &
+                        // 'whose gather it had just served',                 &
+                        LOG_LEVEL_ERROR )
+      end if
+    end if
+#endif
+
+    if ( .not. on_device ) then
+      do k = 1, size(self%recv_index)
+        data_with_halos(self%recv_index(k)) = recv_buf(k)
+      end do
+    end if
 
     n_exchanges = n_exchanges + 1
+    n_messages  = n_messages + n_requests
 
     ! The comparison is on BIT PATTERNS, not on values. Two reasons, and both
     ! matter. The claim being tested is bit-identity, and `/=` on reals is not
@@ -629,7 +817,8 @@ contains
     implicit none
 
     real(real32),         intent(inout), pointer :: data_with_halos(:)
-    type(halo_plan_type), intent(inout)          :: self
+    !> TARGET for the reason the 64-bit twin gives.
+    type(halo_plan_type), intent(inout), target  :: self
     type(xt_redist),      intent(in),    pointer :: redist
 
 #ifdef LEGACY_MPI
@@ -642,6 +831,8 @@ contains
     integer(i_def)             :: i, k, first, last, n_words, n_requests
     integer(i_def)             :: mismatches
     real(real32), allocatable, target :: reference(:)
+    real(real32), pointer      :: send_buf(:), recv_buf(:)
+    logical(l_def)             :: on_device
 
     if ( .not. self%served ) return
 
@@ -649,6 +840,8 @@ contains
       allocate( self%send_buffer32(max(size(self%send_index), 1)) )
       allocate( self%recv_buffer32(max(size(self%recv_index), 1)) )
     end if
+    send_buf => self%send_buffer32
+    recv_buf => self%recv_buffer32
 
     if ( halo_plan_selfcheck_enabled() ) then
       allocate( reference(size(data_with_halos)) )
@@ -663,9 +856,30 @@ contains
     comm%mpi_val = lfric_comm%get_comm_mpi_val()
 #endif
 
-    do k = 1, size(self%send_index)
-      self%send_buffer32(k) = data_with_halos(self%send_index(k))
-    end do
+    ! The gather, on the card or on the host; see the 64-bit twin.
+    on_device = .false._l_def
+#ifdef USE_KOKKOS
+    if ( halo_plan_device_enabled() ) then
+      if ( halo_plan_device_ready( self, 4_c_int,                             &
+                                   kokkos_shared_owns(data_with_halos) ) ) then
+        on_device = ( lfric_kokkos_halo_gather_real32(                        &
+                        self%device_handle, c_loc(data_with_halos(1)),        &
+                        int(size(data_with_halos), c_size_t) ) /= 0_c_int )
+      end if
+      if ( on_device ) then
+        call halo_plan_device_mirrors_real32( self, send_buf, recv_buf )
+        n_device = n_device + 1
+      else
+        n_device_host = n_device_host + 1
+      end if
+    end if
+#endif
+
+    if ( .not. on_device ) then
+      do k = 1, size(self%send_index)
+        send_buf(k) = data_with_halos(self%send_index(k))
+      end do
+    end if
 
     n_requests = 0
 
@@ -675,7 +889,7 @@ contains
       first = self%src_start(i)
       last  = first + n_words - 1
       n_requests = n_requests + 1
-      call mpi_irecv( self%recv_buffer32(first:last), int(n_words),            &
+      call mpi_irecv( recv_buf(first:last), int(n_words),                      &
                       mpi_real,                                                &
                       int(self%src_rank(i)), halo_tag, comm,                   &
                       self%requests(n_requests), ierr )
@@ -687,7 +901,7 @@ contains
       first = self%dest_start(i)
       last  = first + n_words - 1
       n_requests = n_requests + 1
-      call mpi_isend( self%send_buffer32(first:last), int(n_words),            &
+      call mpi_isend( send_buf(first:last), int(n_words),                      &
                       mpi_real,                                                &
                       int(self%dest_rank(i)), halo_tag, comm,                  &
                       self%requests(n_requests), ierr )
@@ -698,11 +912,26 @@ contains
                         mpi_statuses_ignore, ierr )
     end if
 
-    do k = 1, size(self%recv_index)
-      data_with_halos(self%recv_index(k)) = self%recv_buffer32(k)
-    end do
+#ifdef USE_KOKKOS
+    if ( on_device ) then
+      if ( lfric_kokkos_halo_scatter_real32(                                  &
+             self%device_handle, c_loc(data_with_halos(1)),                   &
+             int(size(data_with_halos), c_size_t) ) == 0_c_int ) then
+        call log_event( 'halo_exchange_plan: device scatter refused a plan '  &
+                        // 'whose gather it had just served',                 &
+                        LOG_LEVEL_ERROR )
+      end if
+    end if
+#endif
+
+    if ( .not. on_device ) then
+      do k = 1, size(self%recv_index)
+        data_with_halos(self%recv_index(k)) = recv_buf(k)
+      end do
+    end if
 
     n_exchanges = n_exchanges + 1
+    n_messages  = n_messages + n_requests
 
     ! Bit patterns, for the reasons given in the 64-bit twin: the claim is
     ! bit-identity, and `-finit-real=snan` puts a NaN in every halo word no
@@ -721,23 +950,30 @@ contains
 
 #endif
 
-  !> @brief Reports whether the replay is asked for.
+  !> @brief Resolves `LFRIC_KOKKOS_HALO` to a level, once.
   !> @details Read once, for the reason the shared allocator's own default
   !>          gives: a knob that changed part way through a run would be far
   !>          harder to reason about than one that did not.
   !>
-  !>          The replay refuses to run beside `LFRIC_KOKKOS_MEM_ADVICE=host`
-  !>          and says so. Under that advice the field pages are kept on the
-  !>          host deliberately, so a gather that will later move to the
-  !>          device would fault the whole owned block to the card and lose
-  !>          more than the gather costs. Refusing loudly is the point: a
+  !>          The device level refuses to run beside
+  !>          `LFRIC_KOKKOS_MEM_ADVICE=host` and says so. Under that advice the
+  !>          field pages are kept on the host deliberately, so gathering from
+  !>          the card would fault the whole owned block across the bus and lose
+  !>          far more than the gather costs. Refusing loudly is the point: a
   !>          silent fallback would make an A/B row read as a null lever.
-  !> @return enabled  Whether the replay path should be taken.
-  function halo_plan_mode_enabled() result(enabled)
+  !>
+  !>          The host level is *not* refused under that advice, and the
+  !>          difference is the reason the knob became a level. Level 1 is
+  !>          host code from end to end -- it gathers on the host exactly as
+  !>          OpenMPI's convertor would -- so there is nothing in it for the
+  !>          advice to contradict, and a `1` row under advice `host` is a
+  !>          measurement the spec's Amendment 2 table asks for.
+  !> @return level  `mode_off`, `mode_host` or `mode_device`.
+  function halo_plan_mode() result(level)
 
     implicit none
 
-    logical(l_def) :: enabled
+    integer(i_def) :: level
 
     character(str_def) :: setting
     integer            :: status
@@ -746,18 +982,25 @@ contains
       setting = ''
       call get_environment_variable( mode_variable, setting, status=status )
       if ( status /= 0 ) setting = ''
-      mode_on = ( trim(adjustl(setting)) == '1' )
+      select case ( trim(adjustl(setting)) )
+      case ( '1' )
+        mode_level = mode_host
+      case ( '2' )
+        mode_level = mode_device
+      case default
+        mode_level = mode_off
+      end select
 
-      if ( mode_on ) then
+      if ( mode_level == mode_device ) then
         setting = ''
         call get_environment_variable( advice_variable, setting,             &
                                        status=status )
         if ( status /= 0 ) setting = ''
         if ( trim(adjustl(setting)) == 'host' ) then
           call log_event(                                                    &
-              'halo_exchange_plan: ' // mode_variable // '=1 refused '    // &
-              'because ' // advice_variable // '=host; the replay gathers '//&
-              'from field pages that this advice keeps on the host',         &
+              'halo_exchange_plan: ' // mode_variable // '=2 refused '    // &
+              'because ' // advice_variable // '=host; the device gather ' //&
+              'reads field pages that this advice keeps on the host',        &
               LOG_LEVEL_ERROR )
         end if
       end if
@@ -765,9 +1008,163 @@ contains
       mode_decided = .true._l_def
     end if
 
-    enabled = mode_on
+    level = mode_level
+
+  end function halo_plan_mode
+
+  !> @brief Reports whether the replay is asked for, at either level.
+  !> @return enabled  Whether the replay path should be taken at all.
+  function halo_plan_mode_enabled() result(enabled)
+
+    implicit none
+
+    logical(l_def) :: enabled
+
+    enabled = ( halo_plan_mode() /= mode_off )
 
   end function halo_plan_mode_enabled
+
+  !> @brief Reports whether the gather and the scatter should run on the card.
+  !> @details Only ever true where the Kokkos runtime exists to run them. Every
+  !>          exchange asks again, because the answer is a property of the run
+  !>          and the caller then adds a property of the field -- whether its
+  !>          storage came from the shared allocator -- that this cannot know.
+  !> @return enabled  Whether the device path is asked for.
+  function halo_plan_device_enabled() result(enabled)
+
+    implicit none
+
+    logical(l_def) :: enabled
+
+#ifdef USE_KOKKOS
+    enabled = ( halo_plan_mode() == mode_device )
+#else
+    enabled = .false._l_def
+#endif
+
+  end function halo_plan_device_enabled
+
+#ifdef USE_KOKKOS
+
+  !> @brief Decides, once per plan, whether the card can serve it.
+  !> @details Creating the C++ plan copies both index lists to the card and
+  !>          allocates four buffers, so it happens on the first exchange that
+  !>          wants it and never again -- `device_tried` is what makes a refusal
+  !>          as cheap to repeat as an acceptance, which matters when the answer
+  !>          is asked several hundred times a step.
+  !>
+  !>          The element size is fixed at creation because the buffers are
+  !>          sized in bytes. A routing is keyed by Fortran type and kind, so in
+  !>          practice one plan sees one kind; a call that disagreed would be
+  !>          refused by the C side rather than reinterpreted, and would be
+  !>          served by the host replay.
+  !> @param[in,out] self            The plan.
+  !> @param[in]     element_bytes   4 or 8, the kind asking.
+  !> @param[in]     storage_shared  Whether this field's storage came from the
+  !>                                shared allocator, which only the caller can
+  !>                                say because only the caller has the field.
+  !> @return ready  Whether the device path may be used for this exchange.
+  function halo_plan_device_ready( self, element_bytes, storage_shared )      &
+           result(ready)
+
+    implicit none
+
+    ! TARGET so that the index lists can be handed to C by address. They are
+    ! read once, at creation, and copied to the card there.
+    type(halo_plan_type), intent(inout), target :: self
+    integer(c_int),       intent(in)            :: element_bytes
+    logical(l_def),       intent(in)            :: storage_shared
+
+    logical(l_def) :: ready
+    type(c_ptr)    :: send_address, recv_address
+
+    ready = .false._l_def
+
+    if ( .not. halo_plan_device_enabled() ) return
+    if ( .not. storage_shared ) return
+
+    if ( .not. self%device_tried ) then
+      self%device_tried = .true._l_def
+      ! A zero-length side has no first element to take the address of, and
+      ! the C side is told so by a null rather than by a count it would have
+      ! to trust not to dereference.
+      send_address = c_null_ptr
+      recv_address = c_null_ptr
+      if ( size(self%send_index) > 0 ) send_address = c_loc(self%send_index(1))
+      if ( size(self%recv_index) > 0 ) recv_address = c_loc(self%recv_index(1))
+      if ( c_associated(send_address) .or. c_associated(recv_address) ) then
+        self%device_handle = lfric_kokkos_halo_create(                        &
+            send_address, int(size(self%send_index), c_size_t),               &
+            recv_address, int(size(self%recv_index), c_size_t),               &
+            element_bytes )
+      end if
+    end if
+
+    ready = c_associated( self%device_handle )
+
+  end function halo_plan_device_ready
+
+  !> @brief Aims the two buffer pointers at the plan's pinned mirrors.
+  !> @details These are the addresses MPI sends from and receives into. They do
+  !>          not move for the life of the plan, so this could be done once;
+  !>          it is done per exchange because a `c_f_pointer` costs nothing
+  !>          beside an exchange and holding a Fortran pointer to C-owned memory
+  !>          on a cached object is the kind of thing that survives until
+  !>          someone changes how the plan is copied.
+  !>
+  !>          A zero-length side has no mirror, and the pointer is left where
+  !>          the caller aimed it -- at the plan's own host buffer, which is
+  !>          allocated and never read.
+  !> @param[in]     self      The plan, with its handle created.
+  !> @param[in,out] send_buf  Aimed at the send mirror.
+  !> @param[in,out] recv_buf  Aimed at the receive mirror.
+  subroutine halo_plan_device_mirrors_real64( self, send_buf, recv_buf )
+
+    implicit none
+
+    type(halo_plan_type), intent(in)    :: self
+    real(real64),         pointer, intent(inout) :: send_buf(:)
+    real(real64),         pointer, intent(inout) :: recv_buf(:)
+
+    type(c_ptr) :: mirror
+
+    mirror = lfric_kokkos_halo_send_host( self%device_handle )
+    if ( c_associated(mirror) ) then
+      call c_f_pointer( mirror, send_buf, [size(self%send_index)] )
+    end if
+    mirror = lfric_kokkos_halo_recv_host( self%device_handle )
+    if ( c_associated(mirror) ) then
+      call c_f_pointer( mirror, recv_buf, [size(self%recv_index)] )
+    end if
+
+  end subroutine halo_plan_device_mirrors_real64
+
+  !> @brief The 32-bit twin of `halo_plan_device_mirrors_real64`.
+  !> @param[in]     self      The plan, with its handle created.
+  !> @param[in,out] send_buf  Aimed at the send mirror.
+  !> @param[in,out] recv_buf  Aimed at the receive mirror.
+  subroutine halo_plan_device_mirrors_real32( self, send_buf, recv_buf )
+
+    implicit none
+
+    type(halo_plan_type), intent(in)    :: self
+    real(real32),         pointer, intent(inout) :: send_buf(:)
+    real(real32),         pointer, intent(inout) :: recv_buf(:)
+
+    type(c_ptr) :: mirror
+
+    mirror = lfric_kokkos_halo_send_host( self%device_handle )
+    if ( c_associated(mirror) ) then
+      call c_f_pointer( mirror, send_buf, [size(self%send_index)] )
+    end if
+    mirror = lfric_kokkos_halo_recv_host( self%device_handle )
+    if ( c_associated(mirror) ) then
+      call c_f_pointer( mirror, recv_buf, [size(self%recv_index)] )
+    end if
+
+  end subroutine halo_plan_device_mirrors_real32
+
+#endif
 
   !> @brief Reports whether YAXT should be run beside the replay and compared.
   !> @details The falsifier. With this on, every exchange is done twice -- once
@@ -835,26 +1232,36 @@ contains
 
     implicit none
 
-    character(3) :: mode
+    character(6) :: mode
     character(3) :: check
 
-    if ( halo_plan_mode_enabled() ) then
-      mode = 'on '
-    else
+    ! The level is named rather than numbered, so that a line in a log says
+    ! which of the two things the knob turns on was on without the reader
+    ! having to remember which number meant which.
+    select case ( halo_plan_mode() )
+    case ( mode_host )
+      mode = 'host'
+    case ( mode_device )
+      mode = 'device'
+    case default
       mode = 'off'
-    end if
+    end select
     if ( halo_plan_selfcheck_enabled() ) then
       check = 'on '
     else
       check = 'off'
     end if
 
-    write( error_unit, '(A,A,A,A,A,I0,A,I0,A,I0,A,I0,A,I0)' )               &
+    write( error_unit,                                                      &
+           '(A,A,A,A,A,I0,A,I0,A,I0,A,I0,A,I0,A,I0,A,I0,A,I0)' )            &
         'lfric_kokkos_halo: mode=', trim(mode),                             &
         ' selfcheck=', trim(check),                                         &
         ' plans=', n_plans,                                                 &
         ' exchanges=', n_exchanges,                                         &
         ' fallbacks=', n_fallbacks,                                         &
+        ' device=', n_device,                                               &
+        ' device_host=', n_device_host,                                     &
+        ' messages=', n_messages,                                           &
         ' checked=', n_checked,                                             &
         ' mismatches=', n_mismatch
     flush( error_unit )
