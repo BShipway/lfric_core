@@ -1,0 +1,335 @@
+!-----------------------------------------------------------------------------
+! (C) Crown copyright 2026 Met Office. All rights reserved.
+! The file LICENCE, distributed with this code, contains details of the terms
+! under which the code may be used.
+!-----------------------------------------------------------------------------
+
+!> Test the GCR solver on a badly scaled two-field diagonal system.
+!>
+!> Field 1 has a right-hand side 1000 times larger than field 2 and is solved
+!> exactly in one step; field 2 needs several. Unweighted GCR stops once the
+!> combined residual is small, which leaves field 2 unconverged; with
+!> weight_fields each field must meet its own tolerance.
+!>
+module sci_iterative_solver_mod_test
+
+  use constants_mod,            only : i_def, r_def, l_def
+  use vector_mod,               only : abstract_vector_type
+  use sci_linear_operator_mod,  only : abstract_linear_operator_type
+  use sci_preconditioner_mod,   only : abstract_preconditioner_type
+  use sci_iterative_solver_mod, only : gcr_type
+  use funit
+
+  implicit none
+
+  private
+  public :: test_gcr_unweighted, test_gcr_weighted, &
+            test_gcr_weight_false_same_as_omitted
+
+  !> A vector of two fields held in plain arrays
+  type, extends(abstract_vector_type) :: array_vector_type
+    real(kind=r_def), allocatable :: f1(:), f2(:)
+  contains
+    procedure :: set_scalar  => array_set_scalar
+    procedure :: axpy        => array_axpy
+    procedure :: aypx        => array_aypx
+    procedure :: axpby       => array_axpby
+    procedure :: norm        => array_norm
+    procedure :: field_norm  => array_field_norm
+    procedure :: dot         => array_dot
+    procedure :: field_dot   => array_field_dot
+    procedure :: scale       => array_scale
+    procedure :: duplicate   => array_duplicate
+    procedure :: copy        => array_copy
+    procedure :: vector_size => array_vector_size
+  end type array_vector_type
+
+  !> y = d x, element by element
+  type, extends(abstract_linear_operator_type) :: diagonal_operator_type
+    type(array_vector_type) :: d
+  contains
+    procedure :: apply => diagonal_apply
+  end type diagonal_operator_type
+
+  !> y = x
+  type, extends(abstract_preconditioner_type) :: identity_preconditioner_type
+  contains
+    procedure :: apply => identity_apply
+  end type identity_preconditioner_type
+
+  integer(kind=i_def), parameter :: ndof     = 20
+  integer(kind=i_def), parameter :: gcrk     = 4
+  integer(kind=i_def), parameter :: max_iter = 10
+  real(kind=r_def),    parameter :: r_tol    = 0.1_r_def
+  real(kind=r_def),    parameter :: a_tol    = 1.0e-6_r_def
+
+contains
+
+  !> The badly scaled system: operator, right-hand side and zero first guess
+  subroutine make_system(op, b, x)
+    implicit none
+    type(diagonal_operator_type), intent(out) :: op
+    type(array_vector_type),      intent(out) :: b, x
+    integer(kind=i_def) :: i
+
+    allocate(op%d%f1(ndof), op%d%f2(ndof))
+    op%d%f1 = 2.0_r_def
+    do i = 1, ndof
+      op%d%f2(i) = 1.0_r_def + 9.0_r_def*real(i-1, r_def)/real(ndof-1, r_def)
+    end do
+    allocate(b%f1(ndof), b%f2(ndof))
+    b%f1 = 1000.0_r_def
+    b%f2 = 1.0_r_def
+    allocate(x%f1(ndof), x%f2(ndof))
+    x%f1 = 0.0_r_def
+    x%f2 = 0.0_r_def
+  end subroutine make_system
+
+  !> Residual norm of field n: ||b_n - d_n x_n||
+  function residual_norm(op, b, x, n) result(r)
+    implicit none
+    type(diagonal_operator_type), intent(in) :: op
+    type(array_vector_type),      intent(in) :: b, x
+    integer(kind=i_def),          intent(in) :: n
+    real(kind=r_def) :: r
+
+    if ( n == 1 ) then
+      r = sqrt(sum((b%f1 - op%d%f1*x%f1)**2))
+    else
+      r = sqrt(sum((b%f2 - op%d%f2*x%f2)**2))
+    end if
+  end function residual_norm
+
+  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+  @Test
+  subroutine test_gcr_unweighted( )
+    implicit none
+    type(diagonal_operator_type), target :: op
+    type(identity_preconditioner_type), target :: prec
+    type(array_vector_type) :: b, x
+    type(gcr_type) :: solver
+    real(kind=r_def), allocatable :: r0_1(:), r0_2(:), ar0_1(:), ar0_2(:)
+    real(kind=r_def) :: c
+
+    call make_system(op, b, x)
+    solver = gcr_type(op, prec, gcrk, r_tol, a_tol, max_iter, &
+                      .true._l_def, .false._l_def)
+    call solver%apply(x, b)
+
+    ! First guess P b = b, then one step along A r0 is enough for the
+    ! combined test: x = b + c r0 with c = <r0, A r0> / <A r0, A r0>
+    r0_1  = b%f1 - op%d%f1*b%f1
+    r0_2  = b%f2 - op%d%f2*b%f2
+    ar0_1 = op%d%f1*r0_1
+    ar0_2 = op%d%f2*r0_2
+    c = (sum(r0_1*ar0_1) + sum(r0_2*ar0_2)) / (sum(ar0_1**2) + sum(ar0_2**2))
+    @assertEqual( b%f1 + c*r0_1, x%f1, 1.0e-10_r_def*maxval(abs(x%f1)) )
+    @assertEqual( b%f2 + c*r0_2, x%f2, 1.0e-10_r_def*maxval(abs(x%f2)) )
+
+    ! Field 2 fails the per-field test: the defect weighting removes
+    @assertTrue( residual_norm(op, b, x, 2_i_def) >= r_tol*sqrt(sum(b%f2**2)) )
+  end subroutine test_gcr_unweighted
+
+  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+  @Test
+  subroutine test_gcr_weighted( )
+    implicit none
+    type(diagonal_operator_type), target :: op
+    type(identity_preconditioner_type), target :: prec
+    type(array_vector_type) :: b, x
+    type(gcr_type) :: solver
+
+    call make_system(op, b, x)
+    solver = gcr_type(op, prec, gcrk, r_tol, a_tol, max_iter, &
+                      .true._l_def, .false._l_def, weight_fields=.true._l_def)
+    call solver%apply(x, b)
+
+    @assertTrue( residual_norm(op, b, x, 1_i_def) < max(r_tol*sqrt(sum(b%f1**2)), a_tol) )
+    @assertTrue( residual_norm(op, b, x, 2_i_def) < max(r_tol*sqrt(sum(b%f2**2)), a_tol) )
+  end subroutine test_gcr_weighted
+
+  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+  @Test
+  subroutine test_gcr_weight_false_same_as_omitted( )
+    implicit none
+    type(diagonal_operator_type), target :: op
+    type(identity_preconditioner_type), target :: prec
+    type(array_vector_type) :: b, x_omitted, x_false
+    type(gcr_type) :: solver
+
+    call make_system(op, b, x_omitted)
+    solver = gcr_type(op, prec, gcrk, r_tol, a_tol, max_iter, &
+                      .true._l_def, .false._l_def)
+    call solver%apply(x_omitted, b)
+
+    call make_system(op, b, x_false)
+    solver = gcr_type(op, prec, gcrk, r_tol, a_tol, max_iter, &
+                      .true._l_def, .false._l_def, weight_fields=.false._l_def)
+    call solver%apply(x_false, b)
+
+    @assertTrue( all(x_omitted%f1 == x_false%f1) )
+    @assertTrue( all(x_omitted%f2 == x_false%f2) )
+  end subroutine test_gcr_weight_false_same_as_omitted
+
+  ! ------------------------------------------------------------------------
+  ! array_vector_type
+  ! ------------------------------------------------------------------------
+
+  subroutine array_set_scalar(self, scalar)
+    implicit none
+    class(array_vector_type), intent(inout) :: self
+    real(kind=r_def),         intent(in)    :: scalar
+    self%f1 = scalar
+    self%f2 = scalar
+  end subroutine array_set_scalar
+
+  ! self = alpha x + self
+  subroutine array_axpy(self, alpha, x)
+    implicit none
+    class(array_vector_type),    intent(inout) :: self
+    real(kind=r_def),            intent(in)    :: alpha
+    class(abstract_vector_type), intent(inout) :: x
+    select type(x)
+    type is(array_vector_type)
+      self%f1 = self%f1 + alpha*x%f1
+      self%f2 = self%f2 + alpha*x%f2
+    end select
+  end subroutine array_axpy
+
+  ! self = alpha self + x
+  subroutine array_aypx(self, alpha, x)
+    implicit none
+    class(array_vector_type),    intent(inout) :: self
+    real(kind=r_def),            intent(in)    :: alpha
+    class(abstract_vector_type), intent(inout) :: x
+    select type(x)
+    type is(array_vector_type)
+      self%f1 = alpha*self%f1 + x%f1
+      self%f2 = alpha*self%f2 + x%f2
+    end select
+  end subroutine array_aypx
+
+  ! self = a x + b y
+  subroutine array_axpby(self, a, x, b, y)
+    implicit none
+    class(array_vector_type),    intent(inout) :: self
+    real(kind=r_def),            intent(in)    :: a, b
+    class(abstract_vector_type), intent(in)    :: x, y
+    select type(x)
+    type is(array_vector_type)
+      select type(y)
+      type is(array_vector_type)
+        self%f1 = a*x%f1 + b*y%f1
+        self%f2 = a*x%f2 + b*y%f2
+      end select
+    end select
+  end subroutine array_axpby
+
+  function array_norm(self) result(normal)
+    implicit none
+    class(array_vector_type), intent(in) :: self
+    real(kind=r_def) :: normal
+    normal = sqrt(sum(self%f1**2) + sum(self%f2**2))
+  end function array_norm
+
+  function array_field_norm(self, n) result(normal)
+    implicit none
+    class(array_vector_type), intent(in) :: self
+    integer(kind=i_def),      intent(in) :: n
+    real(kind=r_def) :: normal
+    normal = sqrt(self%field_dot(n, self))
+  end function array_field_norm
+
+  function array_dot(self, x) result(dot_prod)
+    implicit none
+    class(array_vector_type),    intent(in) :: self
+    class(abstract_vector_type), intent(in) :: x
+    real(kind=r_def) :: dot_prod
+    dot_prod = self%field_dot(1_i_def, x) + self%field_dot(2_i_def, x)
+  end function array_dot
+
+  function array_field_dot(self, n, x) result(dot_prod)
+    implicit none
+    class(array_vector_type),    intent(in) :: self
+    integer(kind=i_def),         intent(in) :: n
+    class(abstract_vector_type), intent(in) :: x
+    real(kind=r_def) :: dot_prod
+    dot_prod = 0.0_r_def
+    select type(x)
+    type is(array_vector_type)
+      if ( n == 1 ) then
+        dot_prod = sum(self%f1*x%f1)
+      else
+        dot_prod = sum(self%f2*x%f2)
+      end if
+    end select
+  end function array_field_dot
+
+  subroutine array_scale(self, scalar)
+    implicit none
+    class(array_vector_type), intent(inout) :: self
+    real(kind=r_def),         intent(in)    :: scalar
+    self%f1 = scalar*self%f1
+    self%f2 = scalar*self%f2
+  end subroutine array_scale
+
+  subroutine array_duplicate(self, vec)
+    implicit none
+    class(array_vector_type),                 intent(in)    :: self
+    class(abstract_vector_type), allocatable, intent(inout) :: vec
+    allocate(vec, source=self)
+  end subroutine array_duplicate
+
+  subroutine array_copy(self, source)
+    implicit none
+    class(array_vector_type),    intent(out) :: self
+    class(abstract_vector_type), intent(in)  :: source
+    select type(source)
+    type is(array_vector_type)
+      self%f1 = source%f1
+      self%f2 = source%f2
+    end select
+  end subroutine array_copy
+
+  function array_vector_size(self) result(n_fields)
+    implicit none
+    class(array_vector_type), intent(in) :: self
+    integer(kind=i_def) :: n_fields
+    n_fields = 2
+  end function array_vector_size
+
+  ! ------------------------------------------------------------------------
+  ! Operator and preconditioner
+  ! ------------------------------------------------------------------------
+
+  subroutine diagonal_apply(self, x, y)
+    implicit none
+    class(diagonal_operator_type), intent(inout) :: self
+    class(abstract_vector_type),   intent(in)    :: x
+    class(abstract_vector_type),   intent(inout) :: y
+    select type(x)
+    type is(array_vector_type)
+      select type(y)
+      type is(array_vector_type)
+        y%f1 = self%d%f1*x%f1
+        y%f2 = self%d%f2*x%f2
+      end select
+    end select
+  end subroutine diagonal_apply
+
+  subroutine identity_apply(self, x, y)
+    implicit none
+    class(identity_preconditioner_type), intent(inout) :: self
+    class(abstract_vector_type),         intent(in)    :: x
+    class(abstract_vector_type),         intent(inout) :: y
+    select type(x)
+    type is(array_vector_type)
+      select type(y)
+      type is(array_vector_type)
+        y%f1 = x%f1
+        y%f2 = x%f2
+      end select
+    end select
+  end subroutine identity_apply
+
+end module sci_iterative_solver_mod_test

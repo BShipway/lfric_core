@@ -65,6 +65,11 @@ module sci_r_solver_field_vector_mod
      !> Compute the dot product of two field_vectors returns a real scalar
      !> @param[in] x field_vector to dot self with
      procedure, public  :: dot => dot_field_vector
+     !> Compute the dot product of field n of two field_vectors returns a
+     !> real scalar
+     !> @param[in] n index of the field
+     !> @param[in] x field_vector to dot self with
+     procedure, public  :: field_dot => field_dot_field_vector
      !> multiply a field vector by a scalar
      !> @param [in] scalar real
      procedure, public  :: scale => scale_field_vector
@@ -98,6 +103,7 @@ module sci_r_solver_field_vector_mod
      procedure, private :: norm_field_vector
      procedure, private :: field_norm_field_vector
      procedure, private :: dot_field_vector
+     procedure, private :: field_dot_field_vector
      procedure, private :: aypx_field_vector
      procedure, private :: scale_field_vector
      procedure, private :: duplicate_field_vector
@@ -175,6 +181,28 @@ contains
        call log_event(log_scratch_space,LOG_LEVEL_ERROR)
     end select
   end function dot_field_vector
+
+  ! compute the inner product of field n of two field vectors
+  function field_dot_field_vector(self, n, x) result(dot_prod)
+
+    use sci_psykal_light_mod, only: invoke_rdouble_X_innerproduct_Y
+
+    implicit none
+    class(r_solver_field_vector_type), intent(in) :: self
+    integer(kind=i_def),               intent(in) :: n
+    class(abstract_vector_type),       intent(in) :: x
+    real(kind=r_def)                              :: dot_prod
+
+    select type(x)
+    type is(r_solver_field_vector_type)
+       dot_prod = 0.0_r_def
+       call invoke_rdouble_X_innerproduct_Y( dot_prod, self%vector(n), x%vector(n) )
+    class default
+       write(log_scratch_space,'(A)') &
+            "r_solver_field_vector_mod:field_dot_r_solver_field_vector: type of x is not r_solver_field_vector_type"
+       call log_event(log_scratch_space,LOG_LEVEL_ERROR)
+    end select
+  end function field_dot_field_vector
 
   ! computes y = alpha * x + y on a field vector
   subroutine axpy_field_vector(self, alpha, x)

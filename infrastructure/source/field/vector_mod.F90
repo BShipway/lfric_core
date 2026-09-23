@@ -37,13 +37,17 @@ module vector_mod
      !> Compute norm of the field vector, returns a real scalar
      !! n = sqrt( sum_i( v_i*v_i ))
      procedure (norm_interface),          deferred :: norm
+     !> Compute the norm of a field in the vector, returns a real scalar
+     !> @param[in] n index of field to norm
+     procedure (field_norm_interface),    deferred :: field_norm
      !> Compute the dot product of two vectors returns a real scalar
      !> @param[in] x vector to dot self with
-     procedure (field_norm_interface),    deferred :: field_norm
-     !> Compute the dot product of two fields in the vector returns a real scalar
-     !> @param[in] x vector to dot self with
-     !> @param[in] n index of field to norm
      procedure (dot_interface),           deferred :: dot
+     !> Compute the dot product of one field of two vectors, returns a real
+     !> scalar
+     !> @param[in] n index of the field
+     !> @param[in] x vector to dot self with
+     procedure (field_dot_interface),     deferred :: field_dot
      !> multiply a vector by a scalar
      !> @param [in] scalar real
      procedure (scale_interface),         deferred :: scale
@@ -144,6 +148,21 @@ module vector_mod
        class(abstract_vector_type), intent(in) :: x
        real(kind=r_def)                        :: dot_prod
      end function dot_interface
+  end interface
+
+  abstract interface
+     !> Compute the dot product of field n of two vectors returns a real scalar
+     !> @param[in] n index of the field
+     !> @param[in] x vector to dot self with
+     function field_dot_interface(self, n, x) result(dot_prod)
+       import :: abstract_vector_type
+       import :: r_def
+       import :: i_def
+       class(abstract_vector_type), intent(in) :: self
+       integer(kind=i_def),         intent(in) :: n
+       class(abstract_vector_type), intent(in) :: x
+       real(kind=r_def)                        :: dot_prod
+     end function field_dot_interface
   end interface
 
   abstract interface

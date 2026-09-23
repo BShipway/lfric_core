@@ -167,6 +167,21 @@ contains
          f3_p%vspace%get_undf())
     @assertEqual( test, answer, 1.0e-2_r_def )
 
+    ! Test for field_dot: the per-field products sum to dot
+    test = fv1%field_dot(1_i_def, fv2)
+    answer = (2.5_r_def*2.0_r_def) * f1_p%vspace%get_undf()
+    @assertEqual( test, answer, 1.0e-2_r_def )
+    test = fv1%field_dot(2_i_def, fv2)
+    answer = (2.5_r_def*2.0_r_def) * f2_p%vspace%get_undf()
+    @assertEqual( test, answer, 1.0e-2_r_def )
+    test = fv1%field_dot(3_i_def, fv2)
+    answer = (2.5_r_def*2.0_r_def) * f3_p%vspace%get_undf()
+    @assertEqual( test, answer, 1.0e-2_r_def )
+    test = fv1%field_dot(1_i_def, fv2) + fv1%field_dot(2_i_def, fv2) &
+         + fv1%field_dot(3_i_def, fv2)
+    answer = fv1%dot(fv2)
+    @assertEqual( test, answer, 1.0e-2_r_def )
+
     ! check the norm and the sqrt of dot on itself agree
     test = fv1%norm()
     answer = sqrt(fv1%dot(fv1))

@@ -237,6 +237,8 @@ module sci_iterative_solver_mod
   type, public, extends(abstract_iterative_solver_type) :: gcr_type
      private
      integer(kind=i_def) :: gcrk
+     ! weight each field's inner product by its right-hand side norm
+     logical(kind=l_def) :: weight_fields
    contains
      procedure :: apply => gcr_solve
      procedure :: gcr_solve
@@ -249,7 +251,8 @@ module sci_iterative_solver_mod
 
   interface
      module function gcr_constructor( lin_op, prec, gcrk, r_tol, a_tol, max_iter, &
-                                      monitor_convergence, fail_on_non_converged) &
+                                      monitor_convergence, fail_on_non_converged, &
+                                      weight_fields ) &
           result(self)
        class(abstract_linear_operator_type), target, intent(in) :: lin_op
        class(abstract_preconditioner_type),  target, intent(in) :: prec
@@ -259,6 +262,7 @@ module sci_iterative_solver_mod
        integer(kind=i_def),                          intent(in) :: max_iter
        logical(kind=l_def),                          intent(in) :: monitor_convergence
        logical(kind=l_def),                          intent(in) :: fail_on_non_converged
+       logical(kind=l_def), optional,                intent(in) :: weight_fields
        type(gcr_type) :: self
      end function gcr_constructor
   end interface
@@ -1257,9 +1261,15 @@ contains
   !>                                solver
   !> @param[in] fail_on_non_converged Exit with error if the solver does not
   !>                                  converge
+  !> @param[in] weight_fields Optional, default false. Weight each field's
+  !>                          contribution to every inner product by the
+  !>                          inverse square of its right-hand side norm, so
+  !>                          that the solve converges every field to r_tol
+  !>                          (or a_tol) and not only the largest
   !> @return the constructed GCR solver
   module function gcr_constructor( lin_op, prec, gcrk, r_tol, a_tol, max_iter, &
-                                   monitor_convergence, fail_on_non_converged) &
+                                   monitor_convergence, fail_on_non_converged, &
+                                   weight_fields ) &
        result(self)
     implicit none
     class(abstract_linear_operator_type), target, intent(in) :: lin_op
@@ -1270,6 +1280,7 @@ contains
     integer(kind=i_def),                          intent(in) :: max_iter
     logical(kind=l_def),                          intent(in) :: monitor_convergence
     logical(kind=l_def),                          intent(in) :: fail_on_non_converged
+    logical(kind=l_def), optional,                intent(in) :: weight_fields
     type(gcr_type) :: self
 
     self%lin_op                => lin_op
@@ -1280,6 +1291,8 @@ contains
     self%max_iter              = max_iter
     self%monitor_convergence   = monitor_convergence
     self%fail_on_non_converged = fail_on_non_converged
+    self%weight_fields         = .false.
+    if ( present(weight_fields) ) self%weight_fields = weight_fields
   end function gcr_constructor
 
   !> gcr_solve. Over-rides the abstract interface to do the actual solve.
@@ -1290,6 +1303,10 @@ contains
   !> This the "RHS" or boundary conditions,
   !> @param[inout] x an abstract vector which is the solution
   !> @param[self] The solver which has pointers to the lin_op and preconditioner
+  !> With self%weight_fields, every inner product is
+  !> <u,v>_W = sum_n <u_n,v_n>/s_n**2 with s_n = max(||b_n||, a_tol/r_tol),
+  !> and the solve stops when max_n ||r_n||/s_n < r_tol, that is when
+  !> ||r_n|| < max(r_tol*||b_n||, a_tol) for every field n.
   module subroutine gcr_solve(self, x, b)
     implicit none
     class(gcr_type),              intent(inout) :: self
@@ -1310,6 +1327,13 @@ contains
 
     ! iterators
     integer(kind=i_def) :: iv, ivj, iv_final, iter
+
+    ! diagnostics
+    real(kind=r_def), allocatable, dimension(:) :: initial_error, final_error
+    integer(kind=i_def)                         :: n_fields, n
+
+    ! field weights, 1/s_n**2, used when self%weight_fields is set
+    real(kind=r_def), allocatable, dimension(:) :: weight
 
     call x%duplicate(dx)
     call x%duplicate(res)
@@ -1334,12 +1358,35 @@ contains
       return
     end if
 
+    if ( self%weight_fields ) then
+      allocate( weight(x%vector_size()) )
+      do n = 1, size(weight)
+        alpha = max(b%field_norm(n), self%a_tol/self%r_tol)
+        if ( alpha <= 0.0_r_def ) alpha = sc_err
+        weight(n) = 1.0_r_def/alpha**2
+      end do
+    end if
+
     if ( self%monitor_convergence ) then
-      sc_err = max(sc_err,self%a_tol)
+      if ( self%weight_fields ) then
+        ! err below is max_n ||res_n||/s_n itself
+        init_err = werr(b)
+        sc_err   = 1.0_r_def
+      else
+        sc_err   = max(sc_err,self%a_tol)
+        init_err = sc_err
+      end if
       write( log_scratch_space, '(A,E15.8,":",E15.8)' ) &
-           "GCR starting ... ||b|| = ", b%norm(),sc_err
+           "GCR starting ... ||b|| = ", b%norm(),init_err
       call log_event(log_scratch_space, LOG_LEVEL_INFO)
-      init_err = sc_err
+
+      ! Per-field initial errors, defined as in block_gcr so that the two
+      ! solvers' relative errors can be compared.
+      n_fields = x%vector_size()
+      allocate( initial_error(n_fields), final_error(n_fields) )
+      do n = 1,n_fields
+        initial_error(n) = max(b%field_norm(n), self%a_tol*self%r_tol)
+      end do
     end if
 
     ! Use special DDT to avoid CCE bug.
@@ -1361,20 +1408,20 @@ contains
           call self%lin_op%apply( Pv(iv)%vt, v(iv)%vt )
 
           do ivj = 1, iv-1
-            alpha = v(iv)%vt%dot(v(ivj)%vt)
+            alpha = wdot(v(iv)%vt, v(ivj)%vt)
             call v(iv)%vt%axpy(-alpha, v(ivj)%vt)
             call Pv(iv)%vt%axpy(-alpha, Pv(ivj)%vt)
           end do
-          alpha = v(iv)%vt%norm()
+          alpha = wnorm(v(iv)%vt)
           beta  = 1.0_r_def/alpha
           call v(iv)%vt%scale(beta)
           call Pv(iv)%vt%scale(beta)
-          alpha = res%dot(v(iv)%vt)
+          alpha = wdot(res, v(iv)%vt)
           call dx%axpy(alpha, Pv(iv)%vt)
           call res%axpy(-alpha, v(iv)%vt)
 
           if ( self%monitor_convergence ) then
-            err = res%norm()/sc_err
+            err = werr(res)/sc_err
             iv_final = iv
             if (err < self%r_tol ) exit
           end if
@@ -1388,6 +1435,15 @@ contains
           if (err < self%r_tol ) exit
         end if
     end do
+
+    if ( self%monitor_convergence ) then
+      do n = 1,n_fields
+        final_error(n) = res%field_norm(n)
+        write( log_scratch_space, '(A, I2, 3E16.8)') 'GCR field errors (Init/Final/Rel): ', &
+          n, initial_error(n), final_error(n), final_error(n)/initial_error(n)
+        call log_event( log_scratch_space, LOG_LEVEL_INFO )
+      end do
+    end if
 
     if( (iter >= self%max_iter .and. err > self%r_tol .and. self%monitor_convergence ) &
          .or. ieee_is_nan(err) ) then
@@ -1409,6 +1465,58 @@ contains
     end do
 
     deallocate(v ,Pv)
+    if ( allocated(initial_error) ) deallocate(initial_error, final_error)
+    if ( allocated(weight) ) deallocate(weight)
+
+  contains
+
+    !> Inner product of u and v, weighted by field if self%weight_fields
+    function wdot(u, v) result(dot_prod)
+      implicit none
+      class(abstract_vector_type), intent(in) :: u, v
+      real(kind=r_def) :: dot_prod
+      integer(kind=i_def) :: m
+
+      if ( self%weight_fields ) then
+        dot_prod = 0.0_r_def
+        do m = 1, size(weight)
+          dot_prod = dot_prod + weight(m)*u%field_dot(m, v)
+        end do
+      else
+        dot_prod = u%dot(v)
+      end if
+    end function wdot
+
+    !> Error measure for the stopping test: with self%weight_fields, the
+    !> largest field norm relative to its s_n
+    function werr(u) result(normal)
+      implicit none
+      class(abstract_vector_type), intent(in) :: u
+      real(kind=r_def) :: normal
+      integer(kind=i_def) :: m
+
+      if ( self%weight_fields ) then
+        normal = 0.0_r_def
+        do m = 1, size(weight)
+          normal = max(normal, sqrt(weight(m))*u%field_norm(m))
+        end do
+      else
+        normal = u%norm()
+      end if
+    end function werr
+
+    !> Norm of u induced by wdot
+    function wnorm(u) result(normal)
+      implicit none
+      class(abstract_vector_type), intent(in) :: u
+      real(kind=r_def) :: normal
+
+      if ( self%weight_fields ) then
+        normal = sqrt(wdot(u, u))
+      else
+        normal = u%norm()
+      end if
+    end function wnorm
 
   end subroutine gcr_solve
 end submodule gcr_smod
@@ -1456,7 +1564,6 @@ contains
   end function
 
   !> block_gcr_solve. Over-rides the abstract interface to do the actual solve.
-  !> @todo NB This breaks the API through use of field_norms.  Ticket #??? will address this.
   !> @detail The solver implements right-preconditioning, i.e. is solving A.M{-1}.M.x = b
   !>         as 1)  A.M{-1}.y = b
   !>            2)  M{-1}y = x
@@ -1558,7 +1665,7 @@ contains
             iv_final = iv
             final_error(:) = 0.0_r_def
             ! In gungho, for the semi-implicit solver the fields are organised:
-            ! (pressure, horizontal velocity, vertical velocity).
+            ! (horizontal velocity, pressure, vertical velocity).
             ! Since the vertical velocity term generally controls the convergence
             ! this is tested first and so the testing loop goes backwards through the field vector
             do n = n_fields,1,-1
