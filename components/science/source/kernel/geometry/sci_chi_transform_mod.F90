@@ -42,14 +42,16 @@ implicit none
 private
 
 ! ---------------------------------------------------------------------------- !
-! Private matrices or values that need computing once
+! Matrices or values that need computing once. They are public so that a
+! kernel calling the transforms can be compiled with them in scope, and
+! protected so that only init_chi_transforms and final_chi_transforms set them
 ! ---------------------------------------------------------------------------- !
 
-real(kind=r_def)    :: chi2xyz_rot_mat(3,3)
-real(kind=r_def)    :: xyz2chi_rot_mat(3,3)
-real(kind=r_def)    :: stretch_factor
-logical(kind=l_def) :: to_rotate
-logical(kind=l_def) :: to_stretch
+real(kind=r_def),    public, protected :: chi2xyz_rot_mat(3,3)
+real(kind=r_def),    public, protected :: xyz2chi_rot_mat(3,3)
+real(kind=r_def),    public, protected :: stretch_factor
+logical(kind=l_def), public, protected :: to_rotate
+logical(kind=l_def), public, protected :: to_stretch
 
 ! ---------------------------------------------------------------------------- !
 ! Public subroutines
